@@ -1,200 +1,191 @@
-# MHR - Momentum Human Rig
+# Sam3D + MHR Body Measurement System
 
-A minimal Python package for the Momentum Human Rig - a parametric 3D human body model with identity, pose, and facial expression parameterization.
+Extract 16 precise anthropometric measurements from a single photo using Sam3D and MHR (Momentum Human Rig).
 
-[![arXiv](https://img.shields.io/badge/arXiv-2511.15586-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2511.15586)
+## 🎯 Features
 
-## Overview
+- **Single Image Input** → 16 body measurements
+- **Sam3D** - State-of-the-art 3D body reconstruction from Meta
+- **MHR** - High-fidelity parametric human body model
+- **Colored 3D Visualization** - See measurement zones on the mesh
+- **Gradio Web Interface** - Easy-to-use web UI
+- **Height Calibration** - Scale measurements to target height
 
-![MHR teaser](images/teaser.jpg?raw=true)
+## 📊 Measurements Provided
 
-MHR (Momentum Human Rig) is a high-fidelity 3D human body model that provides:
+| Code | Measurement | Code | Measurement |
+|------|-------------|------|-------------|
+| A | Head Circumference | I | Forearm Right Circumference |
+| B | Neck Circumference | J | Arm Right Length |
+| C | Shoulder to Crotch Height | K | Inside Leg Height |
+| D | Chest Circumference | L | Thigh Left Circumference |
+| E | Waist Circumference | M | Calf Left Circumference |
+| F | Hip Circumference | N | Ankle Left Circumference |
+| G | Wrist Right Circumference | O | Shoulder Breadth |
+| H | Bicep Right Circumference | P | Height (target) |
 
-- **Identity Parameterization**: 45 shape parameters controlling body identity
-- **Pose Parameterization**: 204 model parameters for full-body articulation
-- **Facial Expression**: 72 expression parameters for detailed face animation
-- **Multiple LOD Levels**: 7 levels of detail (LOD 0-6) for different performance requirements
-- **Non-linear Pose Correctives**: Neural network-based pose-dependent deformations
-- **PyTorch Integration**: GPU-accelerated inference for real-time applications
-- **[PyMomentum](https://facebookresearch.github.io/momentum/) Integration**: Compatible with fast CPU solver
+## 🚀 Quick Start
 
-## Installation
+### Prerequisites
+- CUDA-capable GPU (recommended)
+- Conda or Miniconda
+- Pixi package manager
 
-### Option 1. Using pip
+### Installation
 
+1. **Clone Repository**
 ```bash
-# Install PyMomentum (CPU or GPU)
-pip install pymomentum-cpu  # or pymomentum-gpu
+git clone https://github.com/safuaaannn/sam3d-mhr-measurements.git
+cd sam3d-mhr-measurements
+```
 
-# Install MHR
-pip install mhr
+2. **Download Model Assets**
 
-# Download and unzip the model assets
+**MHR Assets:**
+```bash
 curl -OL https://github.com/facebookresearch/MHR/releases/download/v1.0.0/assets.zip
 unzip assets.zip
 ```
 
-### Option 2. Using the torchscript model
-
+**Sam3D Repository:**
 ```bash
-# Download the torchscript model
-curl -OL https://github.com/facebookresearch/MHR/releases/download/v1.0.0/assets.zip
-
-# Unzip torchscript
-unzip -p assets.zip assets/mhr_model.pt  > mhr_model.pt
-
-# Start using the torchscript model
+git clone https://github.com/facebookresearch/sam-3d-body.git
 ```
-New to TorchScript model? In short it's a Graph mode of pytorch models. More details [here](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html#id3). You can take ./demo.py as a reference to start using th torchscript model.
 
-- Advantage: no codebase or model assets are required.
-- Disadvantage: Currently only support for LOD 1; limited access to model properties.
+3. **Setup Environments**
 
-### Option 3. Using Pixi
-
+**For MHR (using Pixi):**
 ```bash
-# Clone the repository
-git clone git@github.com:facebookresearch/MHR.git
-cd MHR
-
-# Download the and unzip model assets
-curl -OL https://github.com/facebookresearch/MHR/releases/download/v1.0.0/assets.zip
-unzip assets.zip
-
-# Install dependencies with Pixi
 pixi install
-
-# Activate the environment
-pixi shell
 ```
 
+**For Sam3D (using Conda):**
+```bash
+conda create -n sam_3d_body python=3.11 -y
+conda activate sam_3d_body
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install pytorch-lightning pyrender opencv-python yacs scikit-image einops timm dill pandas rich hydra-core pyrootutils webdataset networkx==3.2.1 roma joblib huggingface_hub
+pip install 'git+https://github.com/facebookresearch/detectron2.git@a1ce2f9' --no-build-isolation --no-deps
+pip install git+https://github.com/microsoft/MoGe.git
+```
 
+4. **Download Sam3D Model Checkpoint**
+```bash
+cd sam-3d-body
+python download_model.py  # Requires HuggingFace token
+cd ..
+```
 
-### Dependencies
+## 💻 Usage
 
-- Python >= 3.11
-- PyTorch
-- pymomentum >= 0.1.90
-- trimesh >= 4.8.3 (Only for demo.py)
+### Method 1: Command Line (3 Steps)
 
-## Quick Start
+**Step 1: Run Sam3D Inference**
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate sam_3d_body
+python step1_sam3d_inference.py --image /path/to/your/image.jpg --output ./output
+```
 
-### Run the Demo
+**Step 2: Calculate Measurements**
+```bash
+pixi run python step2_mhr_measurements.py --sam3d_output ./output/sam3d_output.pkl --height 173
+```
+
+**Step 3: Generate Colored Visualization**
+```bash
+pixi run python visualize_measurements.py --sam3d_output ./output/sam3d_output.pkl --output ./output/colored_mesh.ply
+```
+
+### Method 2: Web Interface (Gradio)
 
 ```bash
-python demo.py
+bash launch_app.sh
 ```
 
-This will generate a test MHR mesh and compare outputs with the TorchScript model.
+Then open http://localhost:7860 in your browser.
 
-### Visualization Demo
+Upload an image, set target height, and get instant results!
 
-![Visualization Notebook](images/visualization_notebook.png?raw=true)
-
-Interactive Jupyter notebook for MHR visualization. See [`tools/mhr_visualization/README.md`](tools/mhr_visualization/README.md).
-
-
-### SMPL/SMPL-X Conversion
-
-Conversion between MHR and SMPL/SMPL-X. See [`tools/mhr_smpl_conversion/README.md`](tools/mhr_smpl_conversion/README.md).
-
-### Basic Usage
-
-```python
-import torch
-from mhr.mhr import MHR
-
-# Load MHR model (LOD 1, on CPU)
-mhr_model = MHR.from_files(device=torch.device("cpu"), lod=1)
-
-# Define parameters
-batch_size = 2
-identity_coeffs = 0.8 * torch.randn(batch_size, 45)      # Identity
-model_parameters = 0.2 * (torch.rand(batch_size, 204) - 0.5)  # Pose
-face_expr_coeffs = 0.3 * torch.randn(batch_size, 72)     # Facial expression
-
-# Generate mesh vertices and skeleton information (joint orientation and positions).
-vertices, skeleton_state = mhr_model(identity_coeffs, model_parameters, face_expr_coeffs)
-```
-
-## Model Parameters
-
-### Identity Parameters (`identity_coeffs`)
-- **Shape**: `[batch_size, 45]`
-- **Description**: The first 20 control body shape identity, second 20 control head, and the last 5 for hands.
-- **Typical Range**: -3 to +3 (zero-mean, unit variance)
-
-### Model Parameters (`model_parameters`)
-- **Shape**: `[batch_size, 204]`
-- **Description**: Joint angles and scalings
-
-### Expression Parameters (`face_expr_coeffs`)
-- **Shape**: `[batch_size, 72]`
-- **Description**: Facial expression blendshape weights
-- **Typical Range**: -1 to +1
-
-## Project Structure
+## 📁 Project Structure
 
 ```
-MHR/
-├── assets                              # Assets (downloaded and unzipped from release)
-│   ├── compact_v6_1.model              # Model parameterization
-│   ├── corrective_activation.npz       # Pose corrective MLP sparse activations
-│   ├── corrective_blendshapes_lod?.npz # Pose corrective blendshapes
-│   ├── lod?.fbx                        # Rig with identity and expression blendshapes
-│   └── mhr_model.pt                    # Torchscript model
-├── demo.py                             # Basic demo script
-├── mhr                                 # Main package
-│   ├── io.py                           # Asset loading utilities
-│   ├── mhr.py                          # MHR model implementation
-│   └── utils.py                        # Helper functions
-├── pyproject.toml                      # Pixi project configuration
-├── tests                               # Unit tests
-└── tools                               # Additional tools
-    ├── mhr_visualization               # Jupyter visualization
-    └── mhr_smpl_conversion             # Conversion between MHR and SMPL/SMPL-X
+sam3d-mhr-measurements/
+├── step1_sam3d_inference.py    # Sam3D inference script
+├── step2_mhr_measurements.py   # Measurement calculation
+├── visualize_measurements.py   # 3D visualization generator
+├── app_sam3d.py               # Gradio web interface
+├── launch_app.sh              # Launch Gradio app
+├── run_sam3d.sh              # Quick Sam3D runner
+├── mhr/                      # MHR model code
+├── assets/                   # MHR model files (download separately)
+└── sam-3d-body/             # Sam3D repository (clone separately)
 ```
 
-## Testing
+## 🎨 Visualization
 
-Run the test suite:
+The colored 3D mesh shows measurement zones:
+- 🔴 **Red** - Head circumference
+- 🟠 **Orange** - Neck circumference
+- 🟡 **Yellow** - Chest circumference
+- 🟢 **Green** - Waist circumference
+- 🔵 **Cyan** - Hip circumference
+- 🔵 **Blue** - Thigh circumference
+- 🟣 **Purple** - Calf circumference
 
+Open the `.ply` file in MeshLab or Blender to view.
+
+## 🔧 Customization
+
+### Change Target Height
 ```bash
-# Run all tests
-pixi run pytest tests/
-
-# Run specific test
-pixi run pytest tests/test_mhr.py
+# Default is 173 cm, change to any value
+pixi run python step2_mhr_measurements.py --height 180
 ```
 
-## Inferring MHR parameters from images
-
-If you want to do Human Motion Recovery with MHR, head to [Sam3D](https://github.com/facebookresearch/sam-3d-body).
-
-## Contributing
-
-We welcome contributions! Please see [`CONTRIBUTING.md`](CONTRIBUTING.md) for guidelines.
-
-## Code of Conduct
-
-Please read our [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) before contributing.
-
-## Citation
-
-If you use MHR in your research, please cite:
-
-```bibtex
-@misc{MHR:2025,
-      title={MHR: Momentum Human Rig},
-      author={Aaron Ferguson and Ahmed A. A. Osman and Berta Bescos and Carsten Stoll and Chris Twigg and Christoph Lassner and David Otte and Eric Vignola and Fabian Prada and Federica Bogo and Igor Santesteban and Javier Romero and Jenna Zarate and Jeongseok Lee and Jinhyung Park and Jinlong Yang and John Doublestein and Kishore Venkateshan and Kris Kitani and Ladislav Kavan and Marco Dal Farra and Matthew Hu and Matthew Cioffi and Michael Fabris and Michael Ranieri and Mohammad Modarres and Petr Kadlecek and Rawal Khirodkar and Rinat Abdrashitov and Romain Prévost and Roman Rajbhandari and Ronald Mallet and Russell Pearsall and Sandy Kao and Sanjeev Kumar and Scott Parrish and Shoou-I Yu and Shunsuke Saito and Takaaki Shiratori and Te-Li Wang and Tony Tung and Yichen Xu and Yuan Dong and Yuhua Chen and Yuanlu Xu and Yuting Ye and Zhongshi Jiang},
-      year={2025},
-      eprint={2511.15586},
-      archivePrefix={arXiv},
-      primaryClass={cs.GR},
-      url={https://arxiv.org/abs/2511.15586},
-}
+### Process Different Image
+```bash
+# Edit run_sam3d.sh or specify directly
+python step1_sam3d_inference.py --image /path/to/new/image.jpg --output ./output
 ```
 
-## License
+## 📝 Requirements
 
-MHR is licensed under the Apache Software License 2.0, as found in the [LICENSE](LICENSE) file.
+- Python 3.11+
+- CUDA 12.1+ (for GPU acceleration)
+- 16GB+ RAM
+- 10GB+ disk space (for models)
+
+## 🐛 Troubleshooting
+
+**CUDA Error:**
+- Ensure you activate conda environment properly: `source ~/miniconda3/etc/profile.d/conda.sh`
+- Don't use `conda run`, use manual activation
+
+**Model Not Found:**
+- Download MHR assets: `curl -OL https://github.com/facebookresearch/MHR/releases/download/v1.0.0/assets.zip`
+- Download Sam3D checkpoint via `download_model.py`
+
+**Gradio Not Working:**
+- Install opencv and gradio in pixi: `pixi add opencv gradio`
+
+## 📄 License
+
+This project combines:
+- **MHR** - Meta Platforms, Inc. (see MHR LICENSE)
+- **Sam3D** - Meta Platforms, Inc. (see Sam3D LICENSE)
+- **This Integration** - MIT License
+
+## 🙏 Acknowledgments
+
+- [MHR (Momentum Human Rig)](https://github.com/facebookresearch/MHR) by Meta
+- [Sam3D Body](https://github.com/facebookresearch/sam-3d-body) by Meta
+- Built with PyTorch, Gradio, and Trimesh
+
+## 📧 Contact
+
+For issues and questions, please open a GitHub issue.
+
+---
+
+**⭐ Star this repo if you find it useful!**
