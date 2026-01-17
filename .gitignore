@@ -1,0 +1,57 @@
+# Model files and assets (too large for GitHub)
+assets/
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+models/
+sam-3d-body/models/
+
+# Conda/Pixi environments
+.pixi/
+pixi.lock
+*.conda
+*.tar.bz2
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+
+# Output files
+output/
+output_with_openpose/
+*.pkl
+*.ply
+*.obj
+*.jpg
+*.jpeg
+*.png
+
+# OS files
+.DS_Store
+__MACOSX/
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Temporary files
+*.log
+*.tmp
+temp/
+tmp/
+
+# Zip files
+*.zip
