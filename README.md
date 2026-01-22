@@ -95,6 +95,13 @@ pixi run python step2_mhr_measurements.py --sam3d_output ./output/sam3d_output.p
 **Step 3: Generate Colored Visualization**
 ```bash
 pixi run python visualize_measurements.py --sam3d_output ./output/sam3d_output.pkl --output ./output/colored_mesh.ply
+# Or using alternative argument names:
+pixi run python visualize_measurements.py --pkl ./output/sam3d_output.pkl --out ./output/colored_mesh.ply
+```
+
+**Step 4: Interactive 3D Measurement Tool**
+```bash
+pixi run python interactive_measurements.py --pkl ./output/sam3d_output.pkl --height 173
 ```
 
 ### Method 2: Web Interface (Gradio)
@@ -156,6 +163,21 @@ python step1_sam3d_inference.py --image /path/to/new/image.jpg --output ./output
 - 16GB+ RAM
 - 10GB+ disk space (for models)
 
+## 🔍 Verification
+
+Before using the system, verify your setup:
+
+```bash
+python verify_setup.py
+```
+
+This will check:
+- ✓ Project structure and required files
+- ✓ MHR assets and model files
+- ✓ Python dependencies (Pixi environment)
+- ✓ Sam3D repository and conda environment
+- ✓ MHR module import and initialization
+
 ## 🐛 Troubleshooting
 
 **CUDA Error:**
@@ -168,6 +190,11 @@ python step1_sam3d_inference.py --image /path/to/new/image.jpg --output ./output
 
 **Gradio Not Working:**
 - Install opencv and gradio in pixi: `pixi add opencv gradio`
+
+**Path Issues:**
+- All scripts now use relative paths automatically
+- Ensure you run scripts from the project root directory
+- Use `verify_setup.py` to check configuration
 
 ## 📄 License
 

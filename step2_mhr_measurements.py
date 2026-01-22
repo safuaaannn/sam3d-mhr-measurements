@@ -4,13 +4,17 @@ Step 2: MHR Measurement from Sam3D Output
 Loads Sam3D predictions and calculates body measurements using MHR
 """
 import sys
-sys.path.insert(0, '/home/pj/Desktop/MHR')
+from pathlib import Path
+
+# Add project root to path (relative to this script's directory)
+SCRIPT_DIR = Path(__file__).parent.absolute()
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 import pickle
 import torch
 import numpy as np
 import trimesh
-from pathlib import Path
 
 # MHR imports
 from mhr.mhr import MHR
@@ -171,7 +175,7 @@ def calculate_measurements_from_sam3d(sam3d_output_path, target_height_cm=175):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Calculate measurements from Sam3D output")
-    parser.add_argument("--sam3d_output", default="/home/pj/Desktop/MHR/output/sam3d_output.pkl", 
+    parser.add_argument("--sam3d_output", default="./output/sam3d_output.pkl", 
                         help="Path to Sam3D output pickle file")
     parser.add_argument("--height", type=float, default=175, help="Target height in cm")
     

@@ -5,13 +5,18 @@ Runs Sam3D to get MHR parameters and saves them
 """
 import sys
 import os
-sys.path.insert(0, '/home/pj/Desktop/MHR/sam-3d-body')
+from pathlib import Path
+
+# Add sam-3d-body to path (relative to this script's directory)
+SCRIPT_DIR = Path(__file__).parent.absolute()
+SAM3D_BODY_DIR = SCRIPT_DIR / "sam-3d-body"
+if str(SAM3D_BODY_DIR) not in sys.path:
+    sys.path.insert(0, str(SAM3D_BODY_DIR))
 
 import cv2
 import torch
 import numpy as np
 import pickle
-from pathlib import Path
 
 # Sam3D imports
 from notebook.utils import setup_sam_3d_body
