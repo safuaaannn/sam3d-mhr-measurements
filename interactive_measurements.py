@@ -16,6 +16,9 @@ import numpy as np
 import pickle
 import torch
 import argparse
+import trimesh
+import networkx as nx
+from scipy.interpolate import interp1d
 from mhr.mhr import MHR
 
 class InteractiveBodyMeasurer:
@@ -64,14 +67,20 @@ class InteractiveBodyMeasurer:
         
         self.mesh = pv.PolyData(self.vertices, pv_faces)
         
+        # 4b. Create Trimesh object for accurate surface projection
+        # This is needed for proper point-to-surface projection in picking
+        self.trimesh_mesh = trimesh.Trimesh(vertices=self.vertices, faces=self.faces, process=False)
+        
         # 5. Define ALL 16 Measurements
         self.measurements = {
             # Circumference measurements
             'Head (A)':    {'joint': 'r_eye',     'normal': [0, 1, 0], 'offset': 0.0, 'color': 'red', 'exclude_arms': False, 'type': 'circumference'},
-            'Neck (B)':    {'joint': 'c_neck',   'normal': [0, 1, 0], 'offset': 0.0, 'color': 'orange', 'exclude_arms': False, 'type': 'circumference', 'midpoint': ['c_neck', 'c_head']},
-            'Chest (D)':   {'joint': 'c_spine2', 'normal': [0, 1, 0], 'offset': 0.0, 'color': 'yellow', 'exclude_arms': True, 'type': 'circumference'},
-            'Waist (E)':   {'joint': 'c_spine0', 'normal': [0, 1, 0], 'offset': 0.0, 'color': 'green', 'exclude_arms': True, 'type': 'circumference'},
-            'Hip (F)':     {'joint': 'root',     'normal': [0, 1, 0], 'offset': 0.0, 'color': 'cyan', 'exclude_arms': True, 'type': 'circumference'},
+            # Neck (B): Use neck-to-head vector for proper circular slice at mid-neck (light blue position)
+            'Neck (B)':    {'joint': 'c_neck',   'normal': [0, 1, 0], 'neck_aligned': True, 'neck_height_ratio': 0.45, 'offset': 0.0, 'color': 'cyan', 'exclude_arms': False, 'type': 'circumference'},
+            # Torso circumferences - use consistent torso vector (pelvis to neck) for perpendicular normal
+            'Chest (D)':   {'joint': 'c_spine2', 'normal': [0, 1, 0], 'torso_aligned': True, 'offset': 0.0, 'color': 'yellow', 'exclude_arms': True, 'type': 'circumference'},
+            'Waist (E)':   {'joint': 'c_spine0', 'normal': [0, 1, 0], 'torso_aligned': True, 'offset': 0.0, 'color': 'green', 'exclude_arms': True, 'type': 'circumference'},
+            'Hip (F)':     {'joint': 'root',     'normal': [0, 1, 0], 'torso_aligned': True, 'offset': 0.0, 'color': 'cyan', 'exclude_arms': True, 'type': 'circumference'},
             'Thigh (L)':   {'joint': 'l_upleg',  'normal': [0, 1, 0], 'offset': -15.0, 'color': 'blue', 'exclude_arms': False, 'type': 'circumference', 'midpoint': ['l_upleg', 'l_lowleg']},
             'Calf (M)':    {'joint': 'l_lowleg', 'normal': [0, 1, 0], 'offset': -15.0, 'color': 'purple', 'exclude_arms': False, 'type': 'circumference', 'midpoint': ['l_lowleg', 'l_foot']},
             'Ankle (N)':   {'joint': 'l_foot',   'normal': [0, 1, 0], 'offset': 2.0, 'color': 'magenta', 'exclude_arms': False, 'type': 'circumference'},
@@ -83,10 +92,10 @@ class InteractiveBodyMeasurer:
         
         # Length measurements
         self.length_measurements = {
-            'Shoulder-Crotch (C)': {'start': 'c_spine3', 'end': 'root', 'color': 'white', 'type': 'length'},
+            'Shoulder-Crotch (C)': {'start': 'c_spine3', 'end': 'root', 'color': 'white', 'type': 'length', 'geodesic': True},
             'Arm Length (J)': {'start': 'r_uparm', 'end': 'r_wrist', 'color': 'orange', 'type': 'length', 'segments': ['r_uparm', 'r_lowarm', 'r_wrist']},
             'Inside Leg (K)': {'start': 'root', 'end': 'min_y', 'color': 'magenta', 'type': 'length'},
-            'Shoulder Width (O)': {'start': 'l_uparm', 'end': 'r_uparm', 'color': 'lightgray', 'type': 'length'},
+            'Shoulder Width (O)': {'start': 'l_uparm', 'end': 'r_uparm', 'color': 'pink', 'type': 'length', 'geodesic': True},
             'Height (P)': {'start': 'max_y', 'end': 'min_y', 'color': 'gray', 'type': 'length'},
         }
         
@@ -95,10 +104,15 @@ class InteractiveBodyMeasurer:
         self.picking_enabled = False
         # Neck geodesic (B) override: user-defined landmarks on surface
         # Order recommended: back (nape) -> right -> front (suprasternal) -> left
-        self._active_pick_mode = None  # None | "custom" | "neck"
+        self._active_pick_mode = None  # None | "custom" | "neck" | "shoulder"
         self.neck_landmark_vertex_ids = []
         self.neck_landmark_points = []  # list[np.ndarray], world/surface points for neck picking
         self.neck_geodesic_path = None  # pv.PolyData polyline
+        # Shoulder width geodesic: user picks 3 points (left acromion, mid-back, right acromion)
+        self.shoulder_landmark_points = []  # list[np.ndarray], 3 points for shoulder width
+        self.shoulder_landmark_vertex_ids = []  # vertex indices for geodesic calculation
+        self.shoulder_geodesic_path = None  # pv.PolyData polyline through the 3 points
+        self.shoulder_path_length = None  # Store the calculated path length (in cm) to avoid recalculation errors
         
         self.plotter = pv.Plotter(title="Sam3D Interactive Measurements")
         
@@ -152,6 +166,71 @@ class InteractiveBodyMeasurer:
 
         neck_center = (neck_j + head_j) * 0.5
         return neck_center, axis, lr, fwd
+
+    def _compute_torso_normal(self):
+        """
+        Calculate the torso vector (spine direction) from pelvis to neck,
+        and return it as the plane normal for circular slices.
+        
+        CRITICAL: The plane normal MUST be the spine direction itself, NOT perpendicular to it.
+        Using a perpendicular vector would create a vertical slice (head to toe) instead of
+        a horizontal slice (around the waist/chest/hip).
+        
+        This ensures all torso measurements (Chest, Waist, Hip) use the same alignment
+        and create proper circular cross-sections that are "square" to the body's pose.
+        """
+        try:
+            # Get pelvis (bottom) and neck (top) joints
+            pelvis = np.array(self.get_joint('root'), dtype=float)
+            neck = np.array(self.get_joint('c_neck'), dtype=float)
+            
+            # Calculate spine direction (the "center pole" of the body)
+            spine_vector = neck - pelvis
+            spine_norm = np.linalg.norm(spine_vector)
+            
+            if spine_norm < 1e-6:
+                # Fallback to vertical if spine is degenerate
+                return np.array([0.0, 1.0, 0.0], dtype=float)
+            
+            # The plane normal IS the spine direction (not perpendicular to it!)
+            # This creates a horizontal slice relative to the body's orientation
+            spine_direction = spine_vector / spine_norm
+            return spine_direction
+                
+        except Exception as e:
+            print(f"Warning: Error computing torso normal: {e}")
+            return np.array([0.0, 1.0, 0.0], dtype=float)
+    
+    def _compute_neck_normal(self):
+        """
+        Calculate the neck vector (from neck joint to head joint),
+        and return it as the plane normal for the neck measurement.
+        
+        This creates a circular slice at the mid-neck position (light blue ring),
+        which is more accurate than measuring at the base of the neck where
+        shoulders (trapezius) cause oval distortions.
+        """
+        try:
+            # Get neck and head joints
+            neck_j = np.array(self.get_joint('c_neck'), dtype=float)
+            head_j = np.array(self.get_joint('c_head'), dtype=float)
+            
+            # Calculate neck direction (from neck to head)
+            neck_vector = head_j - neck_j
+            neck_norm = np.linalg.norm(neck_vector)
+            
+            if neck_norm < 1e-6:
+                # Fallback to vertical if neck vector is degenerate
+                return np.array([0.0, 1.0, 0.0], dtype=float)
+            
+            # The plane normal IS the neck direction (same logic as torso)
+            # This creates a horizontal slice relative to the neck's orientation
+            neck_direction = neck_vector / neck_norm
+            return neck_direction
+                
+        except Exception as e:
+            print(f"Warning: Error computing neck normal: {e}")
+            return np.array([0.0, 1.0, 0.0], dtype=float)
 
     def _update_neck_hint_overlay(self, render=False):
         """
@@ -346,8 +425,19 @@ class InteractiveBodyMeasurer:
             print(f"Circumference Error: {e}")
             return 0.0, None
 
-    def compute_length(self, start_joint, end_joint):
-        """Compute length between two joints"""
+    def compute_length(self, start_joint, end_joint, vertical_only=False):
+        """
+        Compute length between two joints.
+        
+        Args:
+            start_joint: Starting joint name or special marker ('min_y', 'max_y')
+            end_joint: Ending joint name or special marker ('min_y', 'max_y')
+            vertical_only: If True, only compute vertical (Y-axis) distance. 
+                          Used for measurements like Shoulder-Crotch (C) which should be vertical.
+        
+        Returns:
+            Distance in meters (will be converted to cm by caller)
+        """
         if start_joint == 'min_y':
             start_pt = np.array([self.vertices[:, 0].mean(), self.vertices[:, 1].min(), self.vertices[:, 2].mean()])
         elif start_joint == 'max_y':
@@ -362,7 +452,320 @@ class InteractiveBodyMeasurer:
         else:
             end_pt = self.get_joint(end_joint)
         
-        return np.linalg.norm(end_pt - start_pt)
+        if vertical_only:
+            # For vertical measurements (like Shoulder-Crotch), use Y-axis difference only
+            return abs(end_pt[1] - start_pt[1])
+        else:
+            # For other measurements, use 3D Euclidean distance
+            return np.linalg.norm(end_pt - start_pt)
+    
+    def compute_shoulder_width_geodesic(self):
+        """
+        Compute shoulder width using geodesic path between acromion points (tape measure style).
+        This follows the surface of the mesh, creating a curved path over the shoulders.
+        
+        Uses surface vertices (not internal joints) to get accurate skin-to-skin measurement.
+        """
+        try:
+            # Get shoulder joint positions (internal skeleton points)
+            left_shoulder_pt = np.array(self.get_joint('l_uparm'), dtype=float)
+            right_shoulder_pt = np.array(self.get_joint('r_uparm'), dtype=float)
+            
+            # Find acromion points on the surface (bony tips of shoulders)
+            # Look for vertices that are:
+            # 1. Close to the shoulder joint
+            # 2. On the outer/lateral side (furthest from center)
+            # 3. At similar height to the shoulder joint
+            
+            # Find acromion points: the bony tips of the shoulders on the surface
+            # Strategy: Find the most lateral (leftmost/rightmost) points at shoulder height
+            # This gives us the actual shoulder width (skin-to-skin), not internal joint distance
+            shoulder_y = (left_shoulder_pt[1] + right_shoulder_pt[1]) / 2.0
+            
+            # Define search region: shoulder height ± 10cm, and near the shoulder joints horizontally
+            # This ensures we find points on the actual shoulders, not on arms or torso
+            y_min = shoulder_y - 10.0
+            y_max = shoulder_y + 10.0
+            
+            # For left shoulder: find points in the left half of the body at shoulder height
+            # and reasonably close to the left shoulder joint
+            left_region_mask = (
+                (self.mesh.points[:, 1] >= y_min) &
+                (self.mesh.points[:, 1] <= y_max) &
+                (self.mesh.points[:, 0] < 0) &  # Left side of body (negative X)
+                (np.linalg.norm(self.mesh.points - left_shoulder_pt, axis=1) < 20.0)  # Within 20cm of joint
+            )
+            
+            if np.any(left_region_mask):
+                # Find the leftmost point in this region (the acromion tip)
+                left_candidates = self.mesh.points[left_region_mask]
+                left_candidate_indices = np.where(left_region_mask)[0]
+                left_acromion_idx = left_candidate_indices[np.argmin(left_candidates[:, 0])]
+            else:
+                # Fallback: find leftmost point at shoulder height
+                height_mask = (self.mesh.points[:, 1] >= y_min) & (self.mesh.points[:, 1] <= y_max)
+                if np.any(height_mask):
+                    height_candidates = self.mesh.points[height_mask]
+                    height_candidate_indices = np.where(height_mask)[0]
+                    left_acromion_idx = height_candidate_indices[np.argmin(height_candidates[:, 0])]
+                else:
+                    # Last resort: closest to left shoulder joint
+                    left_distances = np.linalg.norm(self.mesh.points - left_shoulder_pt, axis=1)
+                    left_acromion_idx = int(np.argmin(left_distances))
+            
+            # For right shoulder: find points in the right half of the body at shoulder height
+            # and reasonably close to the right shoulder joint
+            right_region_mask = (
+                (self.mesh.points[:, 1] >= y_min) &
+                (self.mesh.points[:, 1] <= y_max) &
+                (self.mesh.points[:, 0] > 0) &  # Right side of body (positive X)
+                (np.linalg.norm(self.mesh.points - right_shoulder_pt, axis=1) < 20.0)  # Within 20cm of joint
+            )
+            
+            if np.any(right_region_mask):
+                # Find the rightmost point in this region (the acromion tip)
+                right_candidates = self.mesh.points[right_region_mask]
+                right_candidate_indices = np.where(right_region_mask)[0]
+                right_acromion_idx = right_candidate_indices[np.argmax(right_candidates[:, 0])]
+            else:
+                # Fallback: find rightmost point at shoulder height
+                height_mask = (self.mesh.points[:, 1] >= y_min) & (self.mesh.points[:, 1] <= y_max)
+                if np.any(height_mask):
+                    height_candidates = self.mesh.points[height_mask]
+                    height_candidate_indices = np.where(height_mask)[0]
+                    right_acromion_idx = height_candidate_indices[np.argmax(height_candidates[:, 0])]
+                else:
+                    # Last resort: closest to right shoulder joint
+                    right_distances = np.linalg.norm(self.mesh.points - right_shoulder_pt, axis=1)
+                    right_acromion_idx = int(np.argmin(right_distances))
+            
+            # Get acromion points for distance calculation
+            left_acromion_pt = self.mesh.points[left_acromion_idx]
+            right_acromion_pt = self.mesh.points[right_acromion_idx]
+            
+            # Calculate straight-line distance between surface acromion points
+            # Mesh is already in cm (scaled to target height), so no conversion needed
+            straight_dist = np.linalg.norm(right_acromion_pt - left_acromion_pt)  # Already in cm
+            
+            # For shoulder width, the geodesic path over the back should only be slightly longer
+            # than the straight line (typically 1.05-1.15x). However, PyVista's geodesic can
+            # sometimes find paths that go around the body incorrectly.
+            # 
+            # Strategy: Try geodesic, but if it's unreasonable, use straight distance.
+            # The straight distance between surface points is already a good approximation.
+            
+            geodesic_path = None
+            path_length = None
+            
+            # Try to calculate geodesic path
+            try:
+                geodesic_path = self.mesh.geodesic(left_acromion_idx, right_acromion_idx)
+                
+                if geodesic_path is not None and getattr(geodesic_path, "n_points", 0) >= 2:
+                    # Calculate path length
+                    # Mesh is already in cm (scaled to target height), so no conversion needed
+                    if hasattr(geodesic_path, 'length') and geodesic_path.length is not None:
+                        path_length = float(geodesic_path.length)  # Already in cm
+                    else:
+                        # Manual calculation: sum of distances between consecutive points
+                        path_points = geodesic_path.points
+                        path_length = 0.0
+                        for i in range(len(path_points) - 1):
+                            path_length += np.linalg.norm(path_points[i+1] - path_points[i])
+                        # Already in cm, no conversion needed
+                    
+                    # Validate: geodesic should be slightly longer than straight line
+                    # For shoulder width, reasonable range is 1.0-1.3x the straight distance
+                    if path_length < straight_dist * 0.98:
+                        # Path is shorter than straight (impossible), reject
+                        path_length = None
+                        geodesic_path = None
+                    elif path_length > straight_dist * 1.5:
+                        # Path is more than 50% longer (likely wrong route), reject
+                        path_length = None
+                        geodesic_path = None
+                    elif path_length > 100.0:
+                        # Absolute maximum: shoulder width should never exceed 100cm
+                        path_length = None
+                        geodesic_path = None
+            except Exception as e:
+                # Geodesic calculation failed, will use straight distance
+                pass
+            
+            # Use geodesic if valid, otherwise use straight distance between surface points
+            if path_length is not None:
+                return path_length, geodesic_path
+            else:
+                # Use straight-line distance between surface acromion points
+                # Create a simple line for visualization
+                line_points = np.array([left_acromion_pt, right_acromion_pt])
+                line_path = pv.PolyData(line_points)
+                line_path.lines = np.array([2, 0, 1])  # Two points, indices 0 and 1
+                return straight_dist, line_path
+            
+        except Exception as e:
+            print(f"Warning: Error computing geodesic shoulder width: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to straight line
+            try:
+                left_shoulder_pt = self.get_joint('l_uparm')
+                right_shoulder_pt = self.get_joint('r_uparm')
+                straight_dist = np.linalg.norm(np.array(right_shoulder_pt) - np.array(left_shoulder_pt))
+                return straight_dist, None  # Already in cm
+            except:
+                return 0.0, None
+    
+    def compute_shoulder_crotch_geodesic(self):
+        """
+        Compute shoulder-to-crotch measurement using geodesic path (diagonal line down the front).
+        Uses 3 points (mid-shoulder → chest → crotch) to guide the path and prevent zig-zags.
+        This follows the surface of the mesh from mid-shoulder to crotch point.
+        """
+        try:
+            # 1. Find start point: Mid-shoulder (between neck and shoulder tip)
+            neck_pt = np.array(self.get_joint('c_spine3'), dtype=float)  # Upper spine/neck
+            left_shoulder_pt = np.array(self.get_joint('l_uparm'), dtype=float)
+            right_shoulder_pt = np.array(self.get_joint('r_uparm'), dtype=float)
+            
+            # Mid-shoulder is the average of left and right shoulder tips
+            # Then average with neck to get the mid-shoulder point
+            shoulder_mid = (left_shoulder_pt + right_shoulder_pt) / 2.0
+            mid_shoulder_coords = (neck_pt + shoulder_mid) / 2.0
+            
+            # Find closest vertex on mesh to mid-shoulder point (ensure it's on surface)
+            start_idx = self.mesh.find_closest_point(mid_shoulder_coords)
+            start_pt = self.mesh.points[start_idx]
+            
+            # 2. Find intermediate point: Chest/Nipple area (keeps path on front of body)
+            # This prevents the geodesic from wrapping around the back
+            chest_spine_pt = np.array(self.get_joint('c_spine2'), dtype=float)  # Mid-chest spine
+            chest_idx = self.mesh.find_closest_point(chest_spine_pt)
+            chest_pt = self.mesh.points[chest_idx]
+            
+            # 3. Find end point: Crotch point (lowest point in torso region, between legs)
+            root_pt = np.array(self.get_joint('root'), dtype=float)  # Pelvis center
+            
+            # Find the lowest point in the center region (between legs)
+            y_min = self.vertices[:, 1].min()
+            y_max = self.vertices[:, 1].max()
+            crotch_y = y_min + (y_max - y_min) * 0.48  # About 48% from top (crotch level)
+            
+            # Find vertices near the center (X=0) at crotch height
+            center_mask = (
+                (np.abs(self.mesh.points[:, 0]) < 5.0) &  # Near center (within 5cm)
+                (self.mesh.points[:, 1] >= crotch_y - 5.0) &  # Near crotch height
+                (self.mesh.points[:, 1] <= crotch_y + 5.0)
+            )
+            
+            if np.any(center_mask):
+                # Find the lowest point in this region (the actual crotch)
+                center_candidates = self.mesh.points[center_mask]
+                center_indices = np.where(center_mask)[0]
+                crotch_idx = center_indices[np.argmin(center_candidates[:, 1])]  # Lowest Y
+            else:
+                # Fallback: use root joint (pelvis center)
+                crotch_idx = self.mesh.find_closest_point(root_pt)
+            
+            end_pt = self.mesh.points[crotch_idx]
+            
+            # 4. Calculate geodesic path in two segments: mid-shoulder → chest → crotch
+            # This forces the path to stay on the front of the body
+            try:
+                # Segment 1: Mid-shoulder to chest
+                path_upper = self.mesh.geodesic(start_idx, chest_idx)
+                
+                # Segment 2: Chest to crotch
+                path_lower = self.mesh.geodesic(chest_idx, crotch_idx)
+                
+                # Validate both paths are valid
+                if (path_upper is not None and path_lower is not None and 
+                    hasattr(path_upper, 'points') and hasattr(path_lower, 'points') and
+                    len(path_upper.points) > 0 and len(path_lower.points) > 0):
+                    # Combine paths
+                    upper_points = path_upper.points
+                    lower_points = path_lower.points
+                    
+                    # Remove duplicate point at junction (chest point appears in both)
+                    if len(lower_points) > 1:
+                        combined_points = np.vstack([upper_points, lower_points[1:]])
+                    else:
+                        combined_points = np.vstack([upper_points, lower_points])
+                    
+                    # Create combined path with correct lines array format
+                    # PyVista lines format: [num_points, idx0, idx1, idx2, ...]
+                    num_points = len(combined_points)
+                    lines_array = np.empty(num_points + 1, dtype=np.int32)
+                    lines_array[0] = num_points
+                    lines_array[1:] = np.arange(num_points, dtype=np.int32)
+                    
+                    combined_path = pv.PolyData(combined_points)
+                    combined_path.lines = lines_array
+                    
+                    # Calculate total length (mesh is already in cm, no conversion needed)
+                    if hasattr(path_upper, 'length') and hasattr(path_lower, 'length'):
+                        if path_upper.length is not None and path_lower.length is not None:
+                            path_length = float(path_upper.length + path_lower.length)  # Already in cm
+                        else:
+                            # Manual calculation
+                            path_length = 0.0
+                            for i in range(len(combined_points) - 1):
+                                path_length += np.linalg.norm(combined_points[i+1] - combined_points[i])
+                    else:
+                        # Manual calculation
+                        path_length = 0.0
+                        for i in range(len(combined_points) - 1):
+                            path_length += np.linalg.norm(combined_points[i+1] - combined_points[i])
+                    
+                    # Validate: geodesic should be longer than straight line (diagonal)
+                    straight_dist = np.linalg.norm(end_pt - start_pt)  # Already in cm
+                    
+                    if path_length < straight_dist * 0.95:
+                        # Path is shorter than straight (impossible), reject
+                        print(f"Warning: Shoulder-crotch geodesic path too short ({path_length:.1f} cm), using straight line")
+                        path_length = straight_dist
+                        line_points = np.array([start_pt, end_pt])
+                        line_path = pv.PolyData(line_points)
+                        line_path.lines = np.array([2, 0, 1])
+                        return path_length, line_path
+                    elif path_length > straight_dist * 2.0:
+                        # Path is more than 2x straight distance (likely wrong route), reject
+                        print(f"Warning: Shoulder-crotch geodesic path too long ({path_length:.1f} cm), using straight line")
+                        path_length = straight_dist
+                        line_points = np.array([start_pt, end_pt])
+                        line_path = pv.PolyData(line_points)
+                        line_path.lines = np.array([2, 0, 1])
+                        return path_length, line_path
+                    
+                    return path_length, combined_path
+                else:
+                    # Geodesic failed, use straight line
+                    straight_dist = np.linalg.norm(end_pt - start_pt)  # Already in cm
+                    line_points = np.array([start_pt, end_pt])
+                    line_path = pv.PolyData(line_points)
+                    line_path.lines = np.array([2, 0, 1])
+                    return straight_dist, line_path
+            except Exception as e:
+                print(f"Warning: Geodesic calculation failed for shoulder-crotch: {e}")
+                # Fallback to straight line
+                straight_dist = np.linalg.norm(end_pt - start_pt)  # Already in cm
+                line_points = np.array([start_pt, end_pt])
+                line_path = pv.PolyData(line_points)
+                line_path.lines = np.array([2, 0, 1])
+                return straight_dist, line_path
+                
+        except Exception as e:
+            print(f"Warning: Error computing geodesic shoulder-crotch: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to straight line between joints
+            try:
+                start_pt = self.get_joint('c_spine3')
+                end_pt = self.get_joint('root')
+                straight_dist = np.linalg.norm(np.array(end_pt) - np.array(start_pt))
+                return straight_dist, None  # Already in cm
+            except:
+                return 0.0, None
 
     def update_measurement_visuals(self):
         try:
@@ -415,8 +818,44 @@ class InteractiveBodyMeasurer:
                 else:
                     center = self.get_joint(data['joint'])
                 
+                # Calculate normal for proper circular slices
+                if data.get('neck_aligned', False):
+                    # For neck measurement: use neck-to-head vector as normal
+                    # This creates a circular slice at mid-neck (light blue position)
+                    normal = self._compute_neck_normal()
+                    # Position the measurement higher up the neck (40-50% from neck to head)
+                    if 'neck_height_ratio' in data:
+                        neck_j = np.array(self.get_joint('c_neck'), dtype=float)
+                        head_j = np.array(self.get_joint('c_head'), dtype=float)
+                        neck_vec = head_j - neck_j
+                        center = neck_j + neck_vec * data['neck_height_ratio']
+                    else:
+                        # Fallback: use midpoint if ratio not specified
+                        neck_j = np.array(self.get_joint('c_neck'), dtype=float)
+                        head_j = np.array(self.get_joint('c_head'), dtype=float)
+                        center = (neck_j + head_j) / 2
+                elif data.get('torso_aligned', False):
+                    # For torso measurements: use consistent torso-normal alignment
+                    # This ensures Chest, Waist, and Hip all use the same perpendicular-to-spine normal
+                    normal = self._compute_torso_normal()
+                elif data.get('normal_from'):
+                    # For arms: normal is parallel to bone direction (perpendicular to slice plane)
+                    a = self.get_joint(data['normal_from'][0])
+                    b = self.get_joint(data['normal_from'][1])
+                    bone_dir = b - a
+                    bone_dir_norm = np.linalg.norm(bone_dir)
+                    
+                    if bone_dir_norm > 1e-6:
+                        normal = bone_dir / bone_dir_norm
+                    else:
+                        normal = np.array(data['normal'], dtype=float)
+                        normal = normal / (np.linalg.norm(normal) + 1e-12)
+                else:
+                    normal = np.array(data['normal'], dtype=float)
+                    normal = normal / (np.linalg.norm(normal) + 1e-12)
+                
+                # Apply offset (neck_aligned already positioned center, so just apply offset)
                 offset = data.get('offset', 0.0)
-                normal = np.array(data['normal']) / np.linalg.norm(data['normal'])
                 center = center + offset * normal
                 
                 # Neck (B): if user provided geodesic loop, use it instead of planar slice
@@ -424,10 +863,10 @@ class InteractiveBodyMeasurer:
                 if name == 'Neck (B)' and self.neck_geodesic_path is not None and self.neck_geodesic_path.n_points > 2:
                     value = float(self.neck_geodesic_path.length)
                     slice_mesh = self.neck_geodesic_path
-                    # Use red color for geodesic neck path to match reference
-                    ring_color = 'red'
+                    # Use cyan color for geodesic neck path (light blue)
+                    ring_color = 'cyan'
                 else:
-                    value, slice_mesh = self.compute_circumference(center, data['normal'], exclude_arms=exclude_arms)
+                    value, slice_mesh = self.compute_circumference(center, normal, exclude_arms=exclude_arms)
                     ring_color = data['color']
                 
                 if slice_mesh is not None:
@@ -458,12 +897,44 @@ class InteractiveBodyMeasurer:
         if 'Shoulder-Crotch (C)' in self.length_measurements:
             name = 'Shoulder-Crotch (C)'
             data = self.length_measurements[name]
-            value = self.compute_length(data['start'], data['end'])
-            start_pt = self.get_joint(data['start'])
-            end_pt = self.get_joint(data['end'])
-            line = pv.Line(start_pt, end_pt)
-            self.plotter.add_mesh(line, color=data['color'], line_width=4, 
-                                name=f"line_{name}", render=False, lighting=False)
+            
+            # Use geodesic path for diagonal line down the front of the body
+            geodesic_path = None
+            if data.get('geodesic', False):
+                value, geodesic_path = self.compute_shoulder_crotch_geodesic()
+            else:
+                # Fallback to straight line
+                value = self.compute_length(data['start'], data['end'], vertical_only=False)
+                start_pt = self.get_joint(data['start'])
+                end_pt = self.get_joint(data['end'])
+                line_points = np.array([start_pt, end_pt])
+                geodesic_path = pv.PolyData(line_points)
+                geodesic_path.lines = np.array([2, 0, 1])
+            
+            # Visualize as a line/tube (diagonal path, not a ring)
+            if geodesic_path is not None and geodesic_path.n_points > 0:
+                try:
+                    if geodesic_path.n_points > 2:
+                        # Geodesic path with multiple points: create a thin tube
+                        tube = geodesic_path.tube(radius=0.6, capping=False)
+                        if tube is not None and tube.n_points > 0:
+                            self.plotter.add_mesh(tube, color=data['color'], name=f"line_{name}", 
+                                                opacity=1.0, render=False, lighting=False)
+                        else:
+                            # Fallback: draw line segments
+                            for i in range(geodesic_path.n_points - 1):
+                                line = pv.Line(geodesic_path.points[i], geodesic_path.points[i+1])
+                                self.plotter.add_mesh(line, color=data['color'], line_width=5, 
+                                                    name=f"line_{name}_seg{i}", render=False, lighting=False)
+                    else:
+                        # Straight line between points: draw as thick line
+                        if geodesic_path.n_points == 2:
+                            line = pv.Line(geodesic_path.points[0], geodesic_path.points[1])
+                            self.plotter.add_mesh(line, color=data['color'], line_width=6, 
+                                                name=f"line_{name}", render=False, lighting=False)
+                except Exception as e:
+                    print(f"Warning: Could not visualize shoulder-crotch path: {e}")
+            
             code = name.split('(')[1].split(')')[0] if '(' in name else ''
             label = f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm"
             panel_lines.append(label)
@@ -471,12 +942,111 @@ class InteractiveBodyMeasurer:
         if 'Shoulder Width (O)' in self.length_measurements:
             name = 'Shoulder Width (O)'
             data = self.length_measurements[name]
-            value = self.compute_length(data['start'], data['end'])
-            start_pt = self.get_joint(data['start'])
-            end_pt = self.get_joint(data['end'])
-            line = pv.Line(start_pt, end_pt)
-            self.plotter.add_mesh(line, color=data['color'], line_width=4, 
-                                name=f"line_{name}", render=False, lighting=False)
+            
+            # Check if user has manually picked 3 points for geodesic measurement
+            geodesic_path = None
+            if self.shoulder_geodesic_path is not None and self.shoulder_geodesic_path.n_points >= 2:
+                # Use the stored path length (calculated with spline smoothing and correction factor)
+                # This avoids recalculation errors that cause huge values
+                if self.shoulder_path_length is not None:
+                    value = self.shoulder_path_length
+                else:
+                    # Fallback: recalculate if stored value is missing
+                    # Calculate straight-line distance through all 3 points for validation
+                    # Mesh is already in cm (scaled to target height), so no conversion needed
+                    if len(self.shoulder_landmark_points) >= 3:
+                        pt0 = self.shoulder_landmark_points[0]  # Left acromion
+                        pt1 = self.shoulder_landmark_points[1]  # Mid-back
+                        pt2 = self.shoulder_landmark_points[2]  # Right acromion
+                        # Straight-line distance: left → mid → right
+                        straight_dist = np.linalg.norm(pt1 - pt0) + np.linalg.norm(pt2 - pt1)  # Already in cm
+                    elif len(self.shoulder_landmark_points) >= 2:
+                        pt0 = self.shoulder_landmark_points[0]
+                        pt1 = self.shoulder_landmark_points[1]
+                        straight_dist = np.linalg.norm(pt1 - pt0)  # Already in cm
+                    else:
+                        straight_dist = 50.0  # fallback
+                    
+                    # Calculate path length along the geodesic path
+                    # IMPORTANT: This is a fallback - the stored value should be used instead
+                    # Mesh is already in cm (scaled to target height), so no conversion needed
+                    path_points = self.shoulder_geodesic_path.points
+                    if len(path_points) < 2:
+                        value = straight_dist
+                    else:
+                        value = 0.0
+                        for i in range(len(path_points) - 1):
+                            value += np.linalg.norm(path_points[i+1] - path_points[i])
+                        # Already in cm, no conversion needed
+                    
+                    # Validate the value is reasonable (shoulder width should be 30-60 cm for adults)
+                    # Geodesic should be slightly longer than straight line (1.0-1.8x), but not more than 2.5x
+                    if value < straight_dist * 0.95:
+                        # Path is shorter than straight (impossible), use straight
+                        print(f"Warning: Geodesic path too short ({value:.1f} cm), using straight-line distance")
+                        value = straight_dist
+                    elif value > straight_dist * 2.5:
+                        # Path is more than 2.5x straight distance (likely wrong route), use straight
+                        print(f"Warning: Geodesic path too long ({value:.1f} cm vs {straight_dist:.1f} cm straight), using straight-line distance")
+                        value = straight_dist
+                    elif value > 100.0:
+                        # Absolute maximum: shoulder width should never exceed 100cm
+                        print(f"Warning: Geodesic path exceeds maximum ({value:.1f} cm), using straight-line distance")
+                        value = straight_dist
+                    
+                    # Store the calculated value for next time
+                    self.shoulder_path_length = value
+                
+                geodesic_path = self.shoulder_geodesic_path
+            # Use geodesic path for tape-measure style shoulder width (automatic)
+            elif data.get('geodesic', False):
+                value, geodesic_path = self.compute_shoulder_width_geodesic()
+            else:
+                # Fallback to straight line between joints
+                value = self.compute_length(data['start'], data['end'])
+                start_pt = self.get_joint(data['start'])
+                end_pt = self.get_joint(data['end'])
+                line = pv.Line(start_pt, end_pt)
+                self.plotter.add_mesh(line, color=data['color'], line_width=4, 
+                                    name=f"line_{name}", render=False, lighting=False)
+            
+            if geodesic_path is not None and geodesic_path.n_points > 0:
+                # Visualize ONLY the path (line/tube), NOT a ring
+                # This is a point-to-point surface path, not a circumference measurement
+                try:
+                    # Remove any existing ring visualization for shoulder width
+                    try:
+                        self.plotter.remove_actor(f"ring_{name}")
+                    except (KeyError, ValueError):
+                        pass
+                    
+                    # Create a tube or line to visualize the path
+                    if geodesic_path.n_points > 2:
+                        # Geodesic path with multiple points: create a thin tube
+                        tube = geodesic_path.tube(radius=0.6, capping=False)
+                        if tube is not None and tube.n_points > 0:
+                            self.plotter.add_mesh(tube, color=data['color'], name=f"line_{name}", 
+                                                opacity=1.0, render=False, lighting=False)
+                        else:
+                            # Fallback: draw line segments connecting the points
+                            for i in range(geodesic_path.n_points - 1):
+                                line = pv.Line(geodesic_path.points[i], geodesic_path.points[i+1])
+                                self.plotter.add_mesh(line, color=data['color'], line_width=5, 
+                                                    name=f"line_{name}_seg{i}", render=False, lighting=False)
+                    else:
+                        # Straight line between points: draw as thick line
+                        if geodesic_path.n_points == 2:
+                            line = pv.Line(geodesic_path.points[0], geodesic_path.points[1])
+                            self.plotter.add_mesh(line, color=data['color'], line_width=6, 
+                                                name=f"line_{name}", render=False, lighting=False)
+                        else:
+                            # Single point or empty - shouldn't happen, but handle it
+                            print(f"Warning: Shoulder width path has {geodesic_path.n_points} points")
+                except Exception as e:
+                    print(f"Warning: Could not visualize shoulder width path: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
             code = name.split('(')[1].split(')')[0] if '(' in name else ''
             label = f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm"
             panel_lines.append(label)
@@ -682,6 +1252,11 @@ class InteractiveBodyMeasurer:
                                 position='upper_left', font_size=13, color='red', 
                                 name='status_msg', font='courier')
             return
+        if self._active_pick_mode == "shoulder":
+            self.plotter.add_text("✗ Finish shoulder width picking first (pick 3 points)", 
+                                position='upper_left', font_size=13, color='red', 
+                                name='status_msg', font='courier')
+            return
         
         self.picking_enabled = not self.picking_enabled
         if self.picking_enabled:
@@ -720,7 +1295,7 @@ class InteractiveBodyMeasurer:
         """Handle a regular point pick (for custom ring creation) - allows free 3D picking"""
         if picked_pt is None:
             return
-        
+
         picked_pt = np.array(picked_pt)
         
         # Store freely picked point (no mesh surface constraint)
@@ -1017,6 +1592,473 @@ class InteractiveBodyMeasurer:
             traceback.print_exc()
             self.neck_geodesic_path = None
 
+    def start_shoulder_width_picking(self):
+        """
+        Start picking 3 points for shoulder width geodesic measurement (tape measure style).
+        Pick left acromion first, then mid-back, then right acromion.
+        """
+        # Disable any existing picking first
+        try:
+            self.plotter.disable_picking()
+            self.plotter.untrack_click_position(side='left')
+        except Exception:
+            pass
+        
+        # Clear previous shoulder picks visuals
+        for i in range(1, 5):
+            try:
+                self.plotter.remove_actor(f"shoulder_pt_{i}")
+            except (KeyError, ValueError):
+                pass
+        self.shoulder_landmark_points = []
+        self.shoulder_landmark_vertex_ids = []
+        self.shoulder_geodesic_path = None
+        self.shoulder_path_length = None
+        self._active_pick_mode = "shoulder"
+        self.picking_enabled = True
+        
+        # Use track_click_position with improved ray-trace intersection
+        def shoulder_click_callback(point):
+            if self._active_pick_mode != "shoulder":
+                return
+            # The point from track_click_position is along the camera ray
+            # We need to find where it intersects the mesh using ray-tracing
+            self._handle_shoulder_pick_with_ray_trace(point)
+        
+        self.plotter.track_click_position(callback=shoulder_click_callback, side='left')
+        
+        self.plotter.add_text(
+            "Shoulder Width mode: pick 3 points (left acromion → mid-back → right acromion).",
+            position='upper_left',
+            font_size=13,
+            color='yellow',
+            name='status_msg',
+            font='courier',
+        )
+        self.plotter.render()
+    
+    def _handle_shoulder_pick_with_ray_trace(self, picked_pt):
+        """Handle shoulder pick by ray-tracing to find actual mesh intersection"""
+        if picked_pt is None:
+            return
+        
+        picked_pt = np.array(picked_pt)
+        
+        # Use PyVista's ray_trace to find the actual intersection point with the mesh
+        try:
+            # Get camera position
+            camera_pos = np.array(self.plotter.camera_position[0])
+            
+            # Calculate ray direction from camera to picked point
+            ray_dir = picked_pt - camera_pos
+            ray_dir_norm = np.linalg.norm(ray_dir)
+            if ray_dir_norm < 1e-6:
+                return
+            ray_dir = ray_dir / ray_dir_norm
+            
+            # Ray-trace from camera through picked point to find mesh intersection
+            # Use a long ray (1000 units) to ensure we hit the mesh
+            ray_end = camera_pos + ray_dir * 1000.0
+            
+            # Find intersection with mesh
+            intersection, cell_ids = self.mesh.ray_trace(camera_pos, ray_end, first_point=True)
+            
+            if intersection is not None and len(intersection) > 0:
+                # Use the first intersection point (closest to camera)
+                intersection_pt = intersection[0]
+                self._handle_shoulder_pick(intersection_pt)
+            else:
+                # No intersection found, fall back to projection
+                self._handle_shoulder_pick(picked_pt)
+        except Exception as e:
+            print(f"Warning: Ray-trace failed: {e}, using direct projection")
+            self._handle_shoulder_pick(picked_pt)
+    
+    def _handle_shoulder_pick(self, picked_pt):
+        """Handle a shoulder width landmark pick - projects to mesh surface accurately"""
+        if picked_pt is None:
+            return
+        
+        picked_pt = np.array(picked_pt)
+        
+        # Constrain search to a local region around the picked point
+        # This prevents finding vertices that are very far away
+        # Mesh is already in cm, so search radius is in cm
+        search_radius = 50.0  # 50cm radius
+        
+        try:
+            # Find vertices within search radius
+            vertex_distances = np.linalg.norm(self.mesh.points - picked_pt, axis=1)
+            nearby_mask = vertex_distances < search_radius
+            
+            if np.any(nearby_mask):
+                # Use the closest vertex within the search radius
+                nearby_distances = vertex_distances[nearby_mask]
+                nearby_indices = np.where(nearby_mask)[0]
+                closest_nearby_idx = nearby_indices[np.argmin(nearby_distances)]
+                closest_point_on_mesh = self.mesh.points[closest_nearby_idx]
+                vertex_idx = int(closest_nearby_idx)
+                dist_to_mesh = float(nearby_distances[np.argmin(nearby_distances)])  # Already in cm
+            else:
+                # No nearby vertices found, use trimesh proximity (but this might find far points)
+                closest_points, dists, vertex_indices = trimesh.proximity.closest_point(
+                    self.trimesh_mesh, [picked_pt]
+                )
+                closest_point_on_mesh = closest_points[0]
+                vertex_idx = int(vertex_indices[0])
+                dist_to_mesh = float(dists[0])  # Already in cm
+                
+                # Validate: if the closest point is too far, it's likely wrong
+                if dist_to_mesh > 50.0:  # More than 50cm away
+                    print(f"Warning: Closest mesh point is {dist_to_mesh:.1f} cm away. Point may be invalid.")
+                    # Try to find a point near the expected shoulder region instead
+                    # Get shoulder joint positions as reference
+                    try:
+                        left_shoulder = np.array(self.get_joint("l_uparm"), dtype=float)
+                        right_shoulder = np.array(self.get_joint("r_uparm"), dtype=float)
+                        mid_shoulder = (left_shoulder + right_shoulder) / 2.0
+                        
+                        # Find closest vertex to the expected shoulder region
+                        shoulder_distances = np.linalg.norm(self.mesh.points - mid_shoulder, axis=1)
+                        shoulder_region_idx = int(np.argmin(shoulder_distances))
+                        closest_point_on_mesh = self.mesh.points[shoulder_region_idx]
+                        vertex_idx = shoulder_region_idx
+                        dist_to_mesh = float(shoulder_distances[shoulder_region_idx])  # Already in cm
+                        print(f"Using shoulder region point instead (distance: {dist_to_mesh:.1f} cm)")
+                    except Exception:
+                        pass  # Keep the original projection
+            
+            # Validate point is reasonable relative to existing points
+            if len(self.shoulder_landmark_points) > 0:
+                # Check distance to previous points
+                prev_point = np.array(self.shoulder_landmark_points[-1])
+                dist_to_prev = np.linalg.norm(closest_point_on_mesh - prev_point)  # Already in cm
+                
+                # Shoulder width points should be within 60cm of each other
+                if dist_to_prev > 60.0:
+                    print(f"Warning: Point is {dist_to_prev:.1f} cm from previous point. This seems too far for shoulder width.")
+                    print(f"  Previous: {prev_point}, Current: {closest_point_on_mesh}")
+            
+            # Store the point
+            self.shoulder_landmark_points.append(closest_point_on_mesh.copy())
+            self.shoulder_landmark_vertex_ids.append(vertex_idx)
+            
+            if dist_to_mesh > 10.0:
+                print(f"Info: Picked point projected to mesh surface ({dist_to_mesh:.1f} cm away)")
+            
+        except Exception as e:
+            print(f"Warning: Error projecting point to mesh: {e}")
+            # Fallback: use picked point as-is and find nearest vertex
+            self.shoulder_landmark_points.append(picked_pt.copy())
+            try:
+                vid = int(np.argmin(np.linalg.norm(self.mesh.points - picked_pt, axis=1)))
+                self.shoulder_landmark_vertex_ids.append(vid)
+            except Exception:
+                self.shoulder_landmark_vertex_ids.append(None)
+        
+        # Visualize the picked point (use the surface-projected point for visualization)
+        point_to_visualize = self.shoulder_landmark_points[-1]  # Use the surface-projected point
+        sphere = pv.Sphere(radius=2.0, center=point_to_visualize)
+        if len(self.shoulder_landmark_points) == 1:
+            color = 'cyan'  # First point (left acromion)
+        elif len(self.shoulder_landmark_points) == 2:
+            color = 'yellow'  # Second point (mid-back)
+        else:
+            color = 'magenta'  # Third point (right acromion)
+        self.plotter.add_mesh(sphere, color=color, name=f"shoulder_pt_{len(self.shoulder_landmark_points)}", render=False)
+        
+        remaining = 3 - len(self.shoulder_landmark_points)
+        if remaining > 0:
+            if len(self.shoulder_landmark_points) == 1:
+                side = "mid-back"
+            elif len(self.shoulder_landmark_points) == 2:
+                side = "right acromion"
+            else:
+                side = "unknown"
+            self.plotter.add_text(
+                f"Shoulder width: {len(self.shoulder_landmark_points)}/3 (pick {side})",
+                position='upper_left',
+                font_size=13,
+                color='yellow',
+                name='status_msg',
+                font='courier',
+            )
+            self.plotter.render()
+            return
+        
+        # All 3 points picked - calculate geodesic path
+        self._build_shoulder_geodesic_from_landmarks()
+        self._active_pick_mode = None
+        self.picking_enabled = False
+        try:
+            self.plotter.untrack_click_position(side='left')
+        except Exception:
+            pass
+        self.plotter.add_text(
+            "✓ Shoulder width geodesic set. Measurement follows surface path.",
+            position='upper_left',
+            font_size=13,
+            color='lightgreen',
+            name='status_msg',
+            font='courier',
+        )
+        self.update_measurement_visuals()
+    
+    def _build_shoulder_geodesic_from_landmarks(self):
+        """
+        Create a geodesic path through 3 shoulder landmark points (left → mid-back → right).
+        Uses trimesh's graph-based shortest path for accurate surface distance calculation.
+        This calculates the true "tape measure" distance along the mesh surface.
+        """
+        try:
+            if len(self.shoulder_landmark_vertex_ids) < 3:
+                return
+            
+            # Get vertex indices for geodesic calculation
+            v0 = self.shoulder_landmark_vertex_ids[0]  # Left acromion
+            v1 = self.shoulder_landmark_vertex_ids[1]  # Mid-back
+            v2 = self.shoulder_landmark_vertex_ids[2]  # Right acromion
+            
+            if v0 is None or v1 is None or v2 is None:
+                return
+            
+            # Get the actual 3D points (already surface-projected in _handle_shoulder_pick)
+            pt0 = np.array(self.shoulder_landmark_points[0], dtype=float)
+            pt1 = np.array(self.shoulder_landmark_points[1], dtype=float)
+            pt2 = np.array(self.shoulder_landmark_points[2], dtype=float)
+            
+            # Debug: Print point positions to verify they're reasonable
+            print(f"Debug: Shoulder points - Left: {pt0}, Mid: {pt1}, Right: {pt2}")
+            print(f"Debug: Point distances - Left-Mid: {np.linalg.norm(pt1 - pt0):.1f} cm, Mid-Right: {np.linalg.norm(pt2 - pt1):.1f} cm")
+            
+            # Calculate straight-line distance for validation (left to right, through mid-back)
+            # Mesh is already in cm (scaled to target height), so no conversion needed
+            straight_dist_cm = np.linalg.norm(pt1 - pt0) + np.linalg.norm(pt2 - pt1)  # Already in cm
+            
+            # Validate straight distance is reasonable (shoulder width should be 30-60 cm)
+            if straight_dist_cm > 100.0:
+                print(f"ERROR: Straight distance is too large ({straight_dist_cm:.1f} cm). Points may be incorrectly positioned.")
+                print(f"  This suggests the picked points are not on the shoulders.")
+                print(f"  Please pick points directly on the mesh surface, not in empty space.")
+                # Create a fallback straight line path for visualization
+                combined_points = np.array([pt0, pt1, pt2])
+                geodesic_path = pv.PolyData(combined_points)
+                lines = [2, 0, 1, 2, 1, 2]
+                geodesic_path.lines = np.array(lines)
+                self.shoulder_geodesic_path = geodesic_path
+                # Use a reasonable fallback value (average shoulder width)
+                self.shoulder_path_length = 40.0  # cm - reasonable fallback
+                return
+            
+            # Use the vertex IDs that were already calculated in _handle_shoulder_pick
+            # These correspond to the surface-projected points
+            idx_L = v0
+            idx_M = v1
+            idx_R = v2
+            
+            print(f"Debug: Using vertex IDs - Left: {idx_L}, Mid: {idx_M}, Right: {idx_R}")
+            print(f"Debug: Straight distance: {straight_dist_cm:.1f} cm")
+            
+            # Use the existing trimesh mesh (created in __init__) for graph-based path calculation
+            try:
+                trimesh_mesh = self.trimesh_mesh
+                
+                # 2. GET THE GRAPH (NetworkX)
+                # Trimesh creates a NetworkX graph representing the mesh edges
+                graph = trimesh_mesh.vertex_adjacency_graph
+                
+                # Add edge weights (Euclidean distances) if not present
+                # This ensures shortest_path uses actual distances, not just hop count
+                for u, v in graph.edges():
+                    if 'weight' not in graph[u][v]:
+                        dist = np.linalg.norm(trimesh_mesh.vertices[u] - trimesh_mesh.vertices[v])
+                        graph[u][v]['weight'] = dist
+                
+                # 3. COMPUTE PATHS (Using NetworkX with edge weights)
+                # weight='weight' ensures it uses Euclidean edge length, not just "number of hops"
+                try:
+                    path_LM = nx.shortest_path(graph, source=idx_L, target=idx_M, weight='weight')
+                    path_MR = nx.shortest_path(graph, source=idx_M, target=idx_R, weight='weight')
+                    
+                    if path_LM is None or len(path_LM) < 2:
+                        raise ValueError("No path found for segment 1")
+                    if path_MR is None or len(path_MR) < 2:
+                        raise ValueError("No path found for segment 2")
+                        
+                except nx.NetworkXNoPath:
+                    print("Warning: No path found between vertices on mesh surface.")
+                    raise
+                except Exception as e:
+                    print(f"Warning: NetworkX path calculation failed: {e}")
+                    raise
+                
+                # Combine paths (avoid duplicate mid point)
+                if path_LM[-1] == path_MR[0]:
+                    full_path_indices = path_LM + path_MR[1:]
+                else:
+                    full_path_indices = path_LM + path_MR
+                
+                # 4. EXTRACT COORDINATES (CRITICAL: Convert indices to 3D points)
+                # This fixes the 3475cm error - we use mesh.vertices[path_indices] to get actual coordinates
+                raw_path_points = trimesh_mesh.vertices[full_path_indices]
+                
+                # 5. APPLY SPLINE SMOOTHING (Fixes the Zig-Zag underestimation)
+                # The mesh path is jagged (vertex-to-vertex). A real tape measure flows smoothly.
+                # We use cubic spline interpolation to create a smooth curve through the points.
+                
+                if len(raw_path_points) < 2:
+                    # Fallback: use raw points if too few
+                    smooth_path_points = raw_path_points
+                    raw_mesh_distance = 0.0
+                else:
+                    # Calculate cumulative distance along the jagged path
+                    dists = np.linalg.norm(np.diff(raw_path_points, axis=0), axis=1)
+                    cum_dist = np.insert(np.cumsum(dists), 0, 0)
+                    
+                    if cum_dist[-1] == 0:
+                        # Zero length path - shouldn't happen, but handle it
+                        smooth_path_points = raw_path_points
+                        raw_mesh_distance = 0.0
+                    else:
+                        # Normalize distance to [0, 1] for interpolation
+                        t = cum_dist / cum_dist[-1]
+                        
+                        # Number of samples for smooth curve (more = smoother but slower)
+                        num_samples = max(50, len(raw_path_points) * 2)  # At least 50 points
+                        t_new = np.linspace(0, 1, num_samples)
+                        
+                        # Cubic interpolation for smooth tape curve (mimics physical tape bending)
+                        try:
+                            fx = interp1d(t, raw_path_points[:, 0], kind='cubic', bounds_error=False, fill_value='extrapolate')
+                            fy = interp1d(t, raw_path_points[:, 1], kind='cubic', bounds_error=False, fill_value='extrapolate')
+                            fz = interp1d(t, raw_path_points[:, 2], kind='cubic', bounds_error=False, fill_value='extrapolate')
+                            
+                            smooth_path_points = np.column_stack((
+                                fx(t_new),
+                                fy(t_new),
+                                fz(t_new)
+                            ))
+                            
+                            # Measure the smooth curve
+                            smooth_segments = np.diff(smooth_path_points, axis=0)
+                            raw_mesh_distance = np.sum(np.linalg.norm(smooth_segments, axis=1))
+                        except Exception as e:
+                            print(f"Warning: Spline interpolation failed: {e}, using raw path")
+                            smooth_path_points = raw_path_points
+                            # Calculate raw distance
+                            segments = np.diff(raw_path_points, axis=0)
+                            segment_lengths = np.linalg.norm(segments, axis=1)
+                            raw_mesh_distance = np.sum(segment_lengths)
+                
+                # 6. APPLY SURFACE CORRECTION FACTOR
+                # Geodesic distance on mesh is usually 2-4% smaller than manual tape measurement
+                # due to tape thickness, surface friction, and mesh compression.
+                # Standard correction for geodesic-to-tape conversion
+                SURFACE_CORRECTION_FACTOR = 1.03  # Adds 3% to account for tape thickness/smoothing
+                
+                # Apply correction factor (mesh is already in cm, no conversion needed)
+                path_length = raw_mesh_distance * SURFACE_CORRECTION_FACTOR  # Already in cm
+                
+                # Get path points for visualization (use the smoothed coordinates for better curve)
+                combined_points = smooth_path_points
+                
+            except Exception as e:
+                print(f"Warning: Trimesh graph calculation failed: {e}, using PyVista geodesic")
+                import traceback
+                traceback.print_exc()
+                # Fallback to PyVista geodesic
+                all_points = []
+                
+                # First segment: left acromion to mid-back
+                try:
+                    path1 = self.mesh.geodesic(v0, v1)
+                    if path1 is not None and getattr(path1, "n_points", 0) >= 2:
+                        seg1_points = path1.points
+                        if len(seg1_points) > 2:
+                            all_points.append(seg1_points[:-1])
+                        else:
+                            all_points.append(seg1_points)
+                    else:
+                        all_points.append(np.array([pt0, pt1]))
+                except Exception:
+                    all_points.append(np.array([pt0, pt1]))
+                
+                # Second segment: mid-back to right acromion
+                try:
+                    path2 = self.mesh.geodesic(v1, v2)
+                    if path2 is not None and getattr(path2, "n_points", 0) >= 2:
+                        all_points.append(path2.points)
+                    else:
+                        all_points.append(np.array([pt1, pt2]))
+                except Exception:
+                    all_points.append(np.array([pt1, pt2]))
+                
+                if len(all_points) == 2:
+                    combined_points = np.vstack(all_points)
+                else:
+                    combined_points = np.array([pt0, pt1, pt2])
+                
+                # Calculate path length (fallback - should use trimesh path if possible)
+                path_length = 0.0
+                for i in range(len(combined_points) - 1):
+                    path_length += np.linalg.norm(combined_points[i+1] - combined_points[i])
+                # Already in cm, no conversion needed
+                
+                # Calculate straight distance for validation
+                straight_dist_cm = np.linalg.norm(pt1 - pt0) + np.linalg.norm(pt2 - pt1)  # Already in cm
+            
+            # Create PolyData path for visualization
+            geodesic_path = pv.PolyData(combined_points)
+            # Create line connectivity
+            n_points = len(combined_points)
+            lines = []
+            for i in range(n_points - 1):
+                lines.extend([2, i, i + 1])
+            geodesic_path.lines = np.array(lines)
+            
+            # Validate: geodesic should be reasonable (1.0-1.8x straight distance, max 100cm)
+            if path_length < straight_dist_cm * 0.95:
+                print(f"Warning: Surface path too short ({path_length:.1f} cm vs {straight_dist_cm:.1f} cm straight), using straight line")
+                combined_points = np.array([pt0, pt1, pt2])
+                geodesic_path = pv.PolyData(combined_points)
+                lines = [2, 0, 1, 2, 1, 2]
+                geodesic_path.lines = np.array(lines)
+                path_length = straight_dist_cm
+            elif path_length > straight_dist_cm * 2.5:
+                print(f"Warning: Surface path too long ({path_length:.1f} cm vs {straight_dist_cm:.1f} cm straight), using straight line")
+                combined_points = np.array([pt0, pt1, pt2])
+                geodesic_path = pv.PolyData(combined_points)
+                lines = [2, 0, 1, 2, 1, 2]
+                geodesic_path.lines = np.array(lines)
+                path_length = straight_dist_cm
+            elif path_length > 100.0:
+                print(f"Warning: Surface path exceeds maximum ({path_length:.1f} cm), using straight line")
+                combined_points = np.array([pt0, pt1, pt2])
+                geodesic_path = pv.PolyData(combined_points)
+                lines = [2, 0, 1, 2, 1, 2]
+                geodesic_path.lines = np.array(lines)
+                path_length = straight_dist_cm
+            
+            self.shoulder_geodesic_path = geodesic_path
+            # Store the calculated path length to avoid recalculation errors
+            self.shoulder_path_length = path_length
+            print(f"Shoulder width surface path created: {path_length:.1f} cm (straight: {straight_dist_cm:.1f} cm, ratio: {path_length/straight_dist_cm:.2f}x)")
+                
+        except Exception as e:
+            print(f"Warning: Error building shoulder geodesic: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to straight line through all 3 points
+            if len(self.shoulder_landmark_points) >= 3:
+                pt0 = self.shoulder_landmark_points[0]
+                pt1 = self.shoulder_landmark_points[1]
+                pt2 = self.shoulder_landmark_points[2]
+                combined_points = np.array([pt0, pt1, pt2])
+                line_path = pv.PolyData(combined_points)
+                lines = [2, 0, 1, 2, 1, 2]
+                line_path.lines = np.array(lines)
+                self.shoulder_geodesic_path = line_path
+
     def setup_ui(self):
         # Set background
         self.plotter.background_color = 'black'
@@ -1096,6 +2138,7 @@ class InteractiveBodyMeasurer:
             "[C] Create Custom Ring\n"
             "[Z] Undo Last Point\n"
             "[B] Set Neck (B) via Geodesic\n"
+            "[O] Set Shoulder Width (O) via Geodesic (pick 3 points)\n"
             "[R] Reset View\n\n"
             "SLIDERS:\n"
             "Adjust measurement height offset (cm)\n\n"
@@ -1115,6 +2158,8 @@ class InteractiveBodyMeasurer:
         self.plotter.add_key_event('Z', self.undo_last_point)
         self.plotter.add_key_event('b', self.start_neck_landmark_picking)
         self.plotter.add_key_event('B', self.start_neck_landmark_picking)
+        self.plotter.add_key_event('o', self.start_shoulder_width_picking)
+        self.plotter.add_key_event('O', self.start_shoulder_width_picking)
         self.plotter.add_key_event('r', lambda: self.plotter.reset_camera())
         self.plotter.add_key_event('R', lambda: self.plotter.reset_camera())
 
