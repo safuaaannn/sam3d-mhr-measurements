@@ -94,7 +94,7 @@ class InteractiveBodyMeasurer:
         self.length_measurements = {
             'Shoulder-Crotch (C)': {'start': 'c_spine3', 'end': 'root', 'color': 'white', 'type': 'length', 'geodesic': True},
             'Arm Length (J)': {'start': 'r_uparm', 'end': 'r_wrist', 'color': 'orange', 'type': 'length', 'segments': ['r_uparm', 'r_lowarm', 'r_wrist']},
-            'Inside Leg (K)': {'start': 'root', 'end': 'min_y', 'color': 'magenta', 'type': 'length'},
+            'Inside Leg (K)': {'start': 'root', 'end': 'min_y', 'color': 'magenta', 'type': 'length', 'geodesic': True},
             'Shoulder Width (O)': {'start': 'l_uparm', 'end': 'r_uparm', 'color': 'pink', 'type': 'length', 'geodesic': True},
             'Height (P)': {'start': 'max_y', 'end': 'min_y', 'color': 'gray', 'type': 'length'},
         }
@@ -104,7 +104,7 @@ class InteractiveBodyMeasurer:
         self.picking_enabled = False
         # Neck geodesic (B) override: user-defined landmarks on surface
         # Order recommended: back (nape) -> right -> front (suprasternal) -> left
-        self._active_pick_mode = None  # None | "custom" | "neck" | "shoulder"
+        self._active_pick_mode = None  # None | "custom" | "neck" | "shoulder" | "shoulder_crotch"
         self.neck_landmark_vertex_ids = []
         self.neck_landmark_points = []  # list[np.ndarray], world/surface points for neck picking
         self.neck_geodesic_path = None  # pv.PolyData polyline
@@ -113,6 +113,11 @@ class InteractiveBodyMeasurer:
         self.shoulder_landmark_vertex_ids = []  # vertex indices for geodesic calculation
         self.shoulder_geodesic_path = None  # pv.PolyData polyline through the 7 points
         self.shoulder_path_length = None  # Store the calculated path length (in cm) to avoid recalculation errors
+        # Shoulder-crotch geodesic: user picks 3 points (neck → chest/waist → hip) on front
+        self.shoulder_crotch_landmark_points = []  # list[np.ndarray], 3 points for shoulder-crotch
+        self.shoulder_crotch_landmark_vertex_ids = []  # vertex indices for geodesic calculation
+        self.shoulder_crotch_geodesic_path = None  # pv.PolyData polyline through the 3 points
+        self.shoulder_crotch_path_length = None  # Store the calculated path length (in cm)
         
         # Default vertex indices for shoulder breadth (from calibration)
         # These are used when no manual picking has been done
@@ -122,6 +127,19 @@ class InteractiveBodyMeasurer:
         # Cache for default shoulder width calculation (to avoid recalculating on every update)
         self._default_shoulder_width_cached = None
         self._default_shoulder_path_cached = None
+        
+        # Default coordinates for shoulder-crotch measurement (from manual calibration)
+        # These are used when no manual picking has been done
+        # Order: Neck → Chest/Waist → Hip (all on front side)
+        self.default_shoulder_crotch_points = [
+            np.array([-0.9155879, 149.00180054, 27.49173355]),  # Neck (front)
+            np.array([-0.13999495, 126.04371643, 25.42441368]),  # Chest/Waist (front)
+            np.array([-0.93651098, 82.62521362, 6.27735662])   # Hip (front)
+        ]
+        
+        # Cache for default shoulder-crotch calculation
+        self._default_shoulder_crotch_width_cached = None
+        self._default_shoulder_crotch_path_cached = None
         
         self.plotter = pv.Plotter(title="Sam3D Interactive Measurements")
         
@@ -637,81 +655,551 @@ class InteractiveBodyMeasurer:
             traceback.print_exc()
             return 0.0, None
     
-    def compute_shoulder_crotch_geodesic(self):
+    def compute_inside_leg_geodesic(self):
         """
-        Compute shoulder-to-crotch measurement using geodesic path (diagonal line down the front).
-        Uses 3 points (mid-shoulder → chest → crotch) to guide the path and prevent zig-zags.
-        This follows the surface of the mesh from mid-shoulder to crotch point.
+        Compute Inside Leg (Inseam) measurement using geodesic path along the inner leg surface.
+        Path: Saddle point (crotch) → Inner ankle (medial malleolus)
         """
         try:
-            # 1. Find start point: Mid-shoulder (between neck and shoulder tip)
-            neck_pt = np.array(self.get_joint('c_spine3'), dtype=float)  # Upper spine/neck
-            left_shoulder_pt = np.array(self.get_joint('l_uparm'), dtype=float)
-            right_shoulder_pt = np.array(self.get_joint('r_uparm'), dtype=float)
-            
-            # Mid-shoulder is the average of left and right shoulder tips
-            # Then average with neck to get the mid-shoulder point
-            shoulder_mid = (left_shoulder_pt + right_shoulder_pt) / 2.0
-            mid_shoulder_coords = (neck_pt + shoulder_mid) / 2.0
-            
-            # Find closest vertex on mesh to mid-shoulder point (ensure it's on surface)
-            start_idx = self.mesh.find_closest_point(mid_shoulder_coords)
-            start_pt = self.mesh.points[start_idx]
-            
-            # 2. Find intermediate point: Chest/Nipple area (keeps path on front of body)
-            # This prevents the geodesic from wrapping around the back
-            chest_spine_pt = np.array(self.get_joint('c_spine2'), dtype=float)  # Mid-chest spine
-            chest_idx = self.mesh.find_closest_point(chest_spine_pt)
-            chest_pt = self.mesh.points[chest_idx]
-            
-            # 3. Find end point: Crotch point (lowest point in torso region, between legs)
+            # 1. Find start point: Saddle point (crotch) - lowest point between legs
             root_pt = np.array(self.get_joint('root'), dtype=float)  # Pelvis center
+            root_y = root_pt[1]
             
-            # Find the lowest point in the center region (between legs)
-            y_min = self.vertices[:, 1].min()
-            y_max = self.vertices[:, 1].max()
-            crotch_y = y_min + (y_max - y_min) * 0.48  # About 48% from top (crotch level)
+            # Find vertices near pelvis center, at crotch level (slightly below root)
+            # Look for the lowest point in the center region between legs
+            crotch_y = root_y - 5.0  # About 5cm below pelvis center
             
-            # Find vertices near the center (X=0) at crotch height
+            # Find vertices near center line (X=0) at crotch height
             center_mask = (
-                (np.abs(self.mesh.points[:, 0]) < 5.0) &  # Near center (within 5cm)
-                (self.mesh.points[:, 1] >= crotch_y - 5.0) &  # Near crotch height
-                (self.mesh.points[:, 1] <= crotch_y + 5.0)
+                (np.abs(self.mesh.points[:, 0]) < 8.0) &  # Near center (within 8cm)
+                (self.mesh.points[:, 1] >= crotch_y - 8.0) &  # Near crotch height
+                (self.mesh.points[:, 1] <= crotch_y + 8.0)
             )
             
             if np.any(center_mask):
-                # Find the lowest point in this region (the actual crotch)
+                # Find the lowest point in this region (the actual saddle/crotch)
                 center_candidates = self.mesh.points[center_mask]
                 center_indices = np.where(center_mask)[0]
                 crotch_idx = center_indices[np.argmin(center_candidates[:, 1])]  # Lowest Y
+                start_pt = self.mesh.points[crotch_idx]
             else:
-                # Fallback: use root joint (pelvis center)
+                # Fallback: use root joint
                 crotch_idx = self.mesh.find_closest_point(root_pt)
+                start_pt = self.mesh.points[crotch_idx]
             
-            end_pt = self.mesh.points[crotch_idx]
+            print(f"Debug: Inside Leg start point (crotch): {start_pt}")
             
-            # 4. Calculate geodesic path in two segments: mid-shoulder → chest → crotch
-            # This forces the path to stay on the front of the body
+            # 2. Find end point: Inner ankle (medial malleolus) - point on ankle ring closest to center
+            # Get ankle joint
+            ankle_joint = np.array(self.get_joint('l_foot'), dtype=float)  # Left foot (for left leg inseam)
+            ankle_y = ankle_joint[1]
+            
+            # Get ankle circumference slice to find inner point
+            ankle_normal = np.array([0, 1, 0], dtype=float)  # Vertical normal
+            ankle_center = ankle_joint + np.array([0, 2, 0])  # 2cm above foot joint (ankle ring position)
+            
+            # Compute ankle circumference slice
+            _, ankle_slice = self.compute_circumference(ankle_center, ankle_normal, exclude_arms=False)
+            
+            if ankle_slice is not None and ankle_slice.n_points > 0:
+                ankle_slice_points = ankle_slice.points
+                # Find point on slice closest to center line (X=0) - this is the inner ankle
+                center_distances = np.abs(ankle_slice_points[:, 0])  # Distance from center line
+                inner_ankle_idx_on_slice = np.argmin(center_distances)
+                inner_ankle_point = ankle_slice_points[inner_ankle_idx_on_slice]
+                # Find closest mesh vertex to this inner point
+                end_idx = self.mesh.find_closest_point(inner_ankle_point)
+                end_pt = self.mesh.points[end_idx]
+            else:
+                # Fallback: find vertex closest to center line at ankle height
+                ankle_mask = (
+                    (np.abs(self.mesh.points[:, 0]) < 5.0) &  # Near center
+                    (np.abs(self.mesh.points[:, 1] - ankle_y) < 3.0)  # Near ankle height
+                )
+                if np.any(ankle_mask):
+                    ankle_candidates = self.mesh.points[ankle_mask]
+                    ankle_indices = np.where(ankle_mask)[0]
+                    # Prefer point closest to center line
+                    center_dists = np.abs(ankle_candidates[:, 0])
+                    end_idx = ankle_indices[np.argmin(center_dists)]
+                    end_pt = self.mesh.points[end_idx]
+                else:
+                    # Last resort: use ankle joint
+                    end_idx = self.mesh.find_closest_point(ankle_joint)
+                    end_pt = self.mesh.points[end_idx]
+            
+            print(f"Debug: Inside Leg end point (inner ankle): {end_pt}")
+            
+            # 3. Find intermediate point: Inner knee - helps guide path along inner leg
+            knee_joint = np.array(self.get_joint('l_lowleg'), dtype=float)  # Left knee
+            knee_y = knee_joint[1]
+            
+            # Find point on inner side of knee (closest to center line)
+            knee_mask = (
+                (np.abs(self.mesh.points[:, 0]) < 6.0) &  # Near center
+                (np.abs(self.mesh.points[:, 1] - knee_y) < 4.0)  # Near knee height
+            )
+            
+            if np.any(knee_mask):
+                knee_candidates = self.mesh.points[knee_mask]
+                knee_indices = np.where(knee_mask)[0]
+                # Prefer point closest to center line (inner side)
+                center_dists = np.abs(knee_candidates[:, 0])
+                knee_idx = knee_indices[np.argmin(center_dists)]
+                knee_pt = self.mesh.points[knee_idx]
+            else:
+                knee_idx = self.mesh.find_closest_point(knee_joint)
+                knee_pt = self.mesh.points[knee_idx]
+            
+            print(f"Debug: Inside Leg intermediate point (inner knee): {knee_pt}")
+            
+            # 4. Calculate geodesic path in two segments: crotch → inner knee → inner ankle
             try:
-                # Segment 1: Mid-shoulder to chest
-                path_upper = self.mesh.geodesic(start_idx, chest_idx)
+                # Segment 1: Crotch to inner knee
+                path_upper = self.mesh.geodesic(crotch_idx, knee_idx)
                 
-                # Segment 2: Chest to crotch
-                path_lower = self.mesh.geodesic(chest_idx, crotch_idx)
+                # Segment 2: Inner knee to inner ankle
+                path_lower = self.mesh.geodesic(knee_idx, end_idx)
                 
                 # Validate both paths are valid
                 if (path_upper is not None and path_lower is not None and 
                     hasattr(path_upper, 'points') and hasattr(path_lower, 'points') and
                     len(path_upper.points) > 0 and len(path_lower.points) > 0):
                     # Combine paths
-                    upper_points = path_upper.points
-                    lower_points = path_lower.points
+                    upper_points = path_upper.points.copy()
+                    lower_points = path_lower.points.copy()
                     
-                    # Remove duplicate point at junction (chest point appears in both)
+                    # Snap endpoints to exact points
+                    if len(upper_points) > 0:
+                        upper_points[0] = start_pt
+                        upper_points[-1] = knee_pt
+                    if len(lower_points) > 0:
+                        lower_points[0] = knee_pt
+                        lower_points[-1] = end_pt
+                    
+                    # Combine, removing duplicate at junction
                     if len(lower_points) > 1:
                         combined_points = np.vstack([upper_points, lower_points[1:]])
                     else:
                         combined_points = np.vstack([upper_points, lower_points])
+                    
+                    # Ensure exact start and end
+                    combined_points[0] = start_pt
+                    combined_points[-1] = end_pt
+                    
+                    # Create path
+                    full_path = pv.PolyData(combined_points)
+                    n_points = len(combined_points)
+                    lines_array = np.empty(n_points + 1, dtype=np.int32)
+                    lines_array[0] = n_points
+                    lines_array[1:] = np.arange(n_points, dtype=np.int32)
+                    full_path.lines = lines_array
+                    
+                    # Calculate length
+                    path_length = 0.0
+                    for i in range(len(combined_points) - 1):
+                        path_length += np.linalg.norm(combined_points[i+1] - combined_points[i])
+                    
+                    print(f"Debug: Inside Leg geodesic calculated: {path_length:.2f} cm")
+                    return path_length, full_path
+                else:
+                    # Geodesic failed, use straight line
+                    straight_dist = np.linalg.norm(end_pt - start_pt)
+                    line_points = np.array([start_pt, end_pt])
+                    line_path = pv.PolyData(line_points)
+                    line_path.lines = np.array([2, 0, 1])
+                    return straight_dist, line_path
+            except Exception as e:
+                print(f"Warning: Geodesic calculation failed for inside leg: {e}")
+                # Fallback to straight line
+                straight_dist = np.linalg.norm(end_pt - start_pt)
+                line_points = np.array([start_pt, end_pt])
+                line_path = pv.PolyData(line_points)
+                line_path.lines = np.array([2, 0, 1])
+                return straight_dist, line_path
+                
+        except Exception as e:
+            print(f"Warning: Error computing geodesic inside leg: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to straight line
+            try:
+                root_pt = self.get_joint('root')
+                y_min = self.vertices[:, 1].min()
+                mid_x = self.vertices[:, 0].mean()
+                mid_z = self.vertices[:, 2].mean()
+                start_pt = np.array(root_pt)
+                end_pt = np.array([mid_x, y_min, mid_z])
+                straight_dist = np.linalg.norm(end_pt - start_pt)
+                return straight_dist, None
+            except:
+                return 0.0, None
+    
+    def compute_shoulder_crotch_geodesic(self):
+        """
+        Compute shoulder-to-crotch measurement using geodesic path (diagonal line down the front).
+        Priority: 1) Manual picks, 2) Default points, 3) Automatic selection
+        """
+        # Check if user has manually picked points
+        if (self.shoulder_crotch_geodesic_path is not None and 
+            self.shoulder_crotch_path_length is not None and
+            len(self.shoulder_crotch_landmark_points) >= 3):
+            print("Debug: Using manually picked shoulder-crotch points")
+            return self.shoulder_crotch_path_length, self.shoulder_crotch_geodesic_path
+        
+        # Check if we have cached default calculation
+        if (self._default_shoulder_crotch_width_cached is not None and 
+            self._default_shoulder_crotch_path_cached is not None):
+            # Silently return cached result (no debug spam)
+            return self._default_shoulder_crotch_width_cached, self._default_shoulder_crotch_path_cached
+        
+        # Use default points if available
+        if hasattr(self, 'default_shoulder_crotch_points') and len(self.default_shoulder_crotch_points) == 3:
+            try:
+                p0 = self.default_shoulder_crotch_points[0]  # Neck
+                p1 = self.default_shoulder_crotch_points[1]  # Chest/Waist
+                p2 = self.default_shoulder_crotch_points[2]  # Hip
+                
+                print(f"Debug: Using default shoulder-crotch points - Neck: {p0}, Chest/Waist: {p1}, Hip: {p2}")
+                
+                # Find mesh indices
+                idx0 = self.mesh.find_closest_point(p0)
+                idx1 = self.mesh.find_closest_point(p1)
+                idx2 = self.mesh.find_closest_point(p2)
+                
+                # Calculate geodesic paths: neck → chest/waist → hip
+                path_01 = self.mesh.geodesic(idx0, idx1)
+                path_12 = self.mesh.geodesic(idx1, idx2)
+                
+                if path_01 is None or path_12 is None:
+                    print("Warning: Geodesic calculation failed for default points, using straight line")
+                    combined_points = np.array([p0, p1, p2])
+                    total_length = np.linalg.norm(p1 - p0) + np.linalg.norm(p2 - p1)
+                else:
+                    # Combine paths
+                    points_01 = path_01.points.copy()
+                    points_12 = path_12.points.copy()
+                    
+                    # Snap endpoints to exact default points
+                    if len(points_01) > 0:
+                        points_01[0] = p0
+                        points_01[-1] = p1
+                    if len(points_12) > 0:
+                        points_12[0] = p1
+                        points_12[-1] = p2
+                    
+                    # Combine, removing duplicate at junction
+                    if len(points_12) > 1:
+                        combined_points = np.vstack([points_01, points_12[1:]])
+                    else:
+                        combined_points = np.vstack([points_01, points_12])
+                    
+                    # Ensure exact start and end
+                    combined_points[0] = p0
+                    combined_points[-1] = p2
+                    
+                    # Calculate length
+                    total_length = 0.0
+                    for i in range(len(combined_points) - 1):
+                        total_length += np.linalg.norm(combined_points[i+1] - combined_points[i])
+                
+                print(f"Debug: Default Shoulder-Crotch calculated: {total_length:.2f} cm")
+                
+                # Store path and length
+                full_path = pv.PolyData(combined_points)
+                n_points = len(combined_points)
+                lines_array = np.empty(n_points + 1, dtype=np.int32)
+                lines_array[0] = n_points
+                lines_array[1:] = np.arange(n_points, dtype=np.int32)
+                full_path.lines = lines_array
+                
+                # Cache the result
+                self._default_shoulder_crotch_width_cached = total_length
+                self._default_shoulder_crotch_path_cached = full_path
+                
+                return total_length, full_path
+            except Exception as e:
+                print(f"Warning: Error computing default shoulder-crotch: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fall through to automatic selection
+        
+        # Otherwise, use automatic point selection
+        try:
+            # 1. Find start point: Front-most point on Neck B circumference slice (light blue ring)
+            # Get the actual circumference slice and find the front-most point
+            neck_j = np.array(self.get_joint('c_neck'), dtype=float)
+            head_j = np.array(self.get_joint('c_head'), dtype=float)
+            neck_vec = head_j - neck_j
+            neck_center_coords = neck_j + neck_vec * 0.45  # Same as Neck B measurement
+            
+            # Get neck normal (same as Neck B measurement)
+            neck_normal = self._compute_neck_normal()
+            
+            # Compute circumference slice to get actual ring points
+            _, neck_slice = self.compute_circumference(neck_center_coords, neck_normal, exclude_arms=False)
+            
+            chest_spine_pt = np.array(self.get_joint('c_spine2'), dtype=float)
+            
+            # Find front-most point on neck slice (closest to chest)
+            if neck_slice is not None and neck_slice.n_points > 0:
+                neck_slice_points = neck_slice.points
+                # Find point on slice closest to chest (front side)
+                chest_distances = np.linalg.norm(neck_slice_points - chest_spine_pt, axis=1)
+                front_neck_idx_on_slice = np.argmin(chest_distances)
+                front_neck_point = neck_slice_points[front_neck_idx_on_slice]
+                # Find closest mesh vertex to this front point
+                start_idx = self.mesh.find_closest_point(front_neck_point)
+                start_pt = self.mesh.points[start_idx]
+            else:
+                # Fallback: use scoring method
+                neck_distances = np.linalg.norm(self.mesh.points - neck_center_coords, axis=1)
+                neck_candidates = np.argsort(neck_distances)[:50]
+                best_score = float('inf')
+                start_idx = neck_candidates[0]
+                for cand_idx in neck_candidates:
+                    cand_pt = self.mesh.points[cand_idx]
+                    dist_to_neck = np.linalg.norm(cand_pt - neck_center_coords)
+                    dist_to_chest = np.linalg.norm(cand_pt - chest_spine_pt)
+                    # Much stronger preference for front: 50% neck, 50% chest
+                    score = 0.5 * dist_to_neck + 0.5 * dist_to_chest
+                    if score < best_score:
+                        best_score = score
+                        start_idx = cand_idx
+                start_pt = self.mesh.points[start_idx]
+            
+            print(f"Debug: Shoulder-crotch start point (neck): {start_pt}, distance to chest: {np.linalg.norm(start_pt - chest_spine_pt):.2f} cm")
+            
+            # 2. Find intermediate point: Chest/Nipple area (keeps path on front of body)
+            # This prevents the geodesic from wrapping around the back
+            # chest_spine_pt already defined above for chest_z_ref
+            
+            # Find closest point to chest spine - this should already be on the front
+            chest_idx = self.mesh.find_closest_point(chest_spine_pt)
+            chest_pt = self.mesh.points[chest_idx]
+            print(f"Debug: Shoulder-crotch chest point: {chest_pt}")
+            
+            # 3. Find end point: Front-most point on Hip F circumference slice (light blue ring)
+            # Get the actual circumference slice and find the front-most point
+            root_pt = np.array(self.get_joint('root'), dtype=float)  # Pelvis center (hip center)
+            
+            # Get hip normal (same as Hip F measurement - torso aligned)
+            hip_normal = self._compute_torso_normal()
+            
+            # Compute circumference slice to get actual ring points
+            _, hip_slice = self.compute_circumference(root_pt, hip_normal, exclude_arms=True)
+            
+            # Find front-most point on hip slice (closest to chest)
+            if hip_slice is not None and hip_slice.n_points > 0:
+                hip_slice_points = hip_slice.points
+                # Find point on slice closest to chest (front side)
+                chest_distances = np.linalg.norm(hip_slice_points - chest_spine_pt, axis=1)
+                front_hip_idx_on_slice = np.argmin(chest_distances)
+                front_hip_point = hip_slice_points[front_hip_idx_on_slice]
+                # Find closest mesh vertex to this front point
+                end_idx = self.mesh.find_closest_point(front_hip_point)
+                end_pt = self.mesh.points[end_idx]
+            else:
+                # Fallback: use scoring method with stronger front preference
+                hip_distances = np.linalg.norm(self.mesh.points - root_pt, axis=1)
+                hip_candidates = np.argsort(hip_distances)[:50]
+                best_score = float('inf')
+                end_idx = hip_candidates[0]
+                for cand_idx in hip_candidates:
+                    cand_pt = self.mesh.points[cand_idx]
+                    dist_to_hip = np.linalg.norm(cand_pt - root_pt)
+                    dist_to_chest = np.linalg.norm(cand_pt - chest_spine_pt)
+                    # Much stronger preference for front: 50% hip, 50% chest
+                    score = 0.5 * dist_to_hip + 0.5 * dist_to_chest
+                    if score < best_score:
+                        best_score = score
+                        end_idx = cand_idx
+                end_pt = self.mesh.points[end_idx]
+            
+            print(f"Debug: Shoulder-crotch end point (hip): {end_pt}, distance to chest: {np.linalg.norm(end_pt - chest_spine_pt):.2f} cm")
+            
+            # 4. Find waist intermediate point (same as Waist E measurement)
+            # This adds another guide point to keep the path on the front
+            waist_spine_pt = np.array(self.get_joint('c_spine0'), dtype=float)  # Waist spine
+            
+            # Find closest point to waist spine, STRONGLY preferring front-facing points
+            waist_distances = np.linalg.norm(self.mesh.points - waist_spine_pt, axis=1)
+            waist_candidates = np.argsort(waist_distances)[:50]  # Top 50 closest points
+            
+            # Use chest joint as reference - front points are closer to chest than back points
+            best_score = float('inf')
+            waist_idx = waist_candidates[0]  # Default to closest
+            for cand_idx in waist_candidates:
+                cand_pt = self.mesh.points[cand_idx]
+                dist_to_waist = np.linalg.norm(cand_pt - waist_spine_pt)
+                dist_to_chest = np.linalg.norm(cand_pt - chest_spine_pt)
+                # Much stronger preference for front: 40% waist, 60% chest
+                score = 0.4 * dist_to_waist + 0.6 * dist_to_chest
+                if score < best_score:
+                    best_score = score
+                    waist_idx = cand_idx
+            
+            waist_pt = self.mesh.points[waist_idx]
+            print(f"Debug: Shoulder-crotch waist point: {waist_pt}, distance to chest: {np.linalg.norm(waist_pt - chest_spine_pt):.2f} cm")
+            
+            # 5. Define a "front" direction vector to filter back-facing points
+            # Use the direction from spine center to chest as the "forward" direction
+            spine_center = (neck_j + root_pt) / 2.0  # Midpoint of spine
+            forward_direction = chest_spine_pt - spine_center
+            forward_direction = forward_direction / (np.linalg.norm(forward_direction) + 1e-12)
+            
+            # Helper function to check if a point is on the front side
+            def is_front_facing(point, reference_spine_point):
+                """Check if point is on front side by comparing distance to chest vs distance to back"""
+                vec_to_point = point - reference_spine_point
+                # Project onto forward direction
+                forward_component = np.dot(vec_to_point, forward_direction)
+                return forward_component > -5.0  # Allow some tolerance, but prefer front
+            
+            # 6. Calculate geodesic path in three segments: neck → chest → waist → hip
+            # This forces the path to stay on the front of the body
+            try:
+                # Segment 1: Neck to chest
+                path_upper = self.mesh.geodesic(start_idx, chest_idx)
+                
+                # Segment 2: Chest to waist
+                path_mid = self.mesh.geodesic(chest_idx, waist_idx)
+                
+                # Segment 3: Waist to hip
+                path_lower = self.mesh.geodesic(waist_idx, end_idx)
+                
+                # Validate all three paths are valid
+                if (path_upper is not None and path_mid is not None and path_lower is not None and 
+                    hasattr(path_upper, 'points') and hasattr(path_mid, 'points') and hasattr(path_lower, 'points') and
+                    len(path_upper.points) > 0 and len(path_mid.points) > 0 and len(path_lower.points) > 0):
+                    # Combine paths: neck → chest → waist → hip
+                    upper_points = path_upper.points
+                    mid_points = path_mid.points
+                    lower_points = path_lower.points
+                    
+                    # Filter each segment to keep only front-facing points
+                    def filter_to_front_only(points, start_pt_seg, end_pt_seg, segment_name):
+                        """Filter geodesic path to only include front-facing points"""
+                        if len(points) < 3:
+                            return points
+                        
+                        # Calculate forward direction for this segment
+                        seg_direction = end_pt_seg - start_pt_seg
+                        seg_direction = seg_direction / (np.linalg.norm(seg_direction) + 1e-12)
+                        
+                        # Get spine point at middle height of segment
+                        mid_height = (start_pt_seg[1] + end_pt_seg[1]) / 2.0
+                        ref_spine = spine_center.copy()
+                        ref_spine[1] = mid_height
+                        
+                        front_points = [start_pt_seg]  # Always keep start
+                        
+                        for i in range(1, len(points) - 1):
+                            pt = points[i]
+                            # Check if point is on front side
+                            vec_to_pt = pt - ref_spine
+                            forward_component = np.dot(vec_to_pt, forward_direction)
+                            
+                            # Also check distance to chest - front points are closer
+                            dist_to_chest = np.linalg.norm(pt - chest_spine_pt)
+                            pt_height = pt[1]
+                            # Estimate expected chest distance at this height
+                            height_ratio = (pt_height - root_pt[1]) / (neck_j[1] - root_pt[1])
+                            expected_chest_dist = np.linalg.norm(chest_spine_pt - ref_spine) * (1.0 - height_ratio * 0.3)
+                            
+                            # Keep point if it's forward-facing AND reasonably close to chest
+                            if forward_component > -3.0 and dist_to_chest < expected_chest_dist * 1.5:
+                                front_points.append(pt)
+                        
+                        front_points.append(end_pt_seg)  # Always keep end
+                        
+                        if len(front_points) < 2:
+                            # If filtering removed too many, return original but ensure start/end
+                            return np.array([start_pt_seg] + list(points[1:-1]) + [end_pt_seg])
+                        
+                        return np.array(front_points)
+                    
+                    # Filter each segment
+                    upper_points = filter_to_front_only(upper_points, start_pt, chest_pt, "upper")
+                    mid_points = filter_to_front_only(mid_points, chest_pt, waist_pt, "mid")
+                    lower_points = filter_to_front_only(lower_points, waist_pt, end_pt, "lower")
+                    
+                    # Remove duplicate points at junctions
+                    combined_points = upper_points.copy()
+                    if len(mid_points) > 1:
+                        # Check if last point of upper matches first of mid
+                        if np.linalg.norm(combined_points[-1] - mid_points[0]) < 0.5:
+                            combined_points = np.vstack([combined_points, mid_points[1:]])
+                        else:
+                            combined_points = np.vstack([combined_points, mid_points])
+                    else:
+                        combined_points = np.vstack([combined_points, mid_points])
+                    if len(lower_points) > 1:
+                        # Check if last point of mid matches first of lower
+                        if np.linalg.norm(combined_points[-1] - lower_points[0]) < 0.5:
+                            combined_points = np.vstack([combined_points, lower_points[1:]])
+                        else:
+                            combined_points = np.vstack([combined_points, lower_points])
+                    else:
+                        combined_points = np.vstack([combined_points, lower_points])
+                    
+                    # Ensure start and end points are exact
+                    combined_points[0] = start_pt
+                    combined_points[-1] = end_pt
+                    
+                    # Validate that path is actually on the front
+                    # Check average forward component of path points
+                    path_forward_components = []
+                    for pt in combined_points:
+                        pt_height = pt[1]
+                        ref_spine = spine_center.copy()
+                        ref_spine[1] = pt_height
+                        vec_to_pt = pt - ref_spine
+                        forward_component = np.dot(vec_to_pt, forward_direction)
+                        path_forward_components.append(forward_component)
+                    
+                    avg_forward = np.mean(path_forward_components)
+                    print(f"Debug: Average forward component of path: {avg_forward:.2f} (positive = front, negative = back)")
+                    
+                    # If path is still going to the back (negative average), construct manual front path
+                    if avg_forward < 0:
+                        print("Warning: Geodesic path goes to back, constructing manual front-only path")
+                        # Construct manual path using front-facing vertices at different heights
+                        manual_path_points = []
+                        heights = np.linspace(start_pt[1], end_pt[1], 20)  # 20 points along height
+                        
+                        for h in heights:
+                            # Find front-most vertex at this height
+                            height_mask = np.abs(self.mesh.points[:, 1] - h) < 3.0  # Within 3cm of target height
+                            if not np.any(height_mask):
+                                continue
+                            
+                            candidates = self.mesh.points[height_mask]
+                            candidate_indices = np.where(height_mask)[0]
+                            
+                            # Score by: close to center (X=0) AND close to chest (front)
+                            best_score = float('inf')
+                            best_idx = None
+                            for i, cand_pt in enumerate(candidates):
+                                dist_to_center_x = abs(cand_pt[0])  # Distance from center line
+                                dist_to_chest = np.linalg.norm(cand_pt - chest_spine_pt)
+                                # Strong preference for front: 30% center, 70% chest
+                                score = 0.3 * dist_to_center_x + 0.7 * dist_to_chest
+                                if score < best_score:
+                                    best_score = score
+                                    best_idx = candidate_indices[i]
+                            
+                            if best_idx is not None:
+                                manual_path_points.append(self.mesh.points[best_idx])
+                        
+                        if len(manual_path_points) >= 2:
+                            # Ensure start and end are exact
+                            manual_path_points[0] = start_pt
+                            manual_path_points[-1] = end_pt
+                            combined_points = np.array(manual_path_points)
+                            print(f"Debug: Using manual front-only path with {len(combined_points)} points")
+                    
+                    print(f"Debug: Final path has {len(combined_points)} points")
                     
                     # Create combined path with correct lines array format
                     # PyVista lines format: [num_points, idx0, idx1, idx2, ...]
@@ -724,9 +1212,9 @@ class InteractiveBodyMeasurer:
                     combined_path.lines = lines_array
                     
                     # Calculate total length (mesh is already in cm, no conversion needed)
-                    if hasattr(path_upper, 'length') and hasattr(path_lower, 'length'):
-                        if path_upper.length is not None and path_lower.length is not None:
-                            path_length = float(path_upper.length + path_lower.length)  # Already in cm
+                    if (hasattr(path_upper, 'length') and hasattr(path_mid, 'length') and hasattr(path_lower, 'length')):
+                        if (path_upper.length is not None and path_mid.length is not None and path_lower.length is not None):
+                            path_length = float(path_upper.length + path_mid.length + path_lower.length)  # Already in cm
                         else:
                             # Manual calculation
                             path_length = 0.0
@@ -781,9 +1269,13 @@ class InteractiveBodyMeasurer:
             traceback.print_exc()
             # Fallback to straight line between joints
             try:
-                start_pt = self.get_joint('c_spine3')
-                end_pt = self.get_joint('root')
-                straight_dist = np.linalg.norm(np.array(end_pt) - np.array(start_pt))
+                # Use neck center and hip center (same as measurement points)
+                neck_j = np.array(self.get_joint('c_neck'), dtype=float)
+                head_j = np.array(self.get_joint('c_head'), dtype=float)
+                neck_vec = head_j - neck_j
+                neck_center = neck_j + neck_vec * 0.45
+                hip_center = np.array(self.get_joint('root'), dtype=float)
+                straight_dist = np.linalg.norm(hip_center - neck_center)
                 return straight_dist, None  # Already in cm
             except:
                 return 0.0, None
@@ -1205,6 +1697,55 @@ class InteractiveBodyMeasurer:
                     line = pv.Line(start_pt, end_pt)
                     self.plotter.add_mesh(line, color=data['color'], line_width=3, 
                                         name=f"line_{name}", render=False, lighting=False)
+                elif name == 'Inside Leg (K)':
+                    # Use geodesic path for inside leg (inseam) along inner leg surface
+                    geodesic_path = None
+                    if data.get('geodesic', False):
+                        value, geodesic_path = self.compute_inside_leg_geodesic()
+                    else:
+                        # Fallback to straight line
+                        value = self.compute_length(start_joint, end_joint)
+                        if start_joint == 'min_y':
+                            start_pt = np.array([self.vertices[:, 0].mean(), self.vertices[:, 1].min(), self.vertices[:, 2].mean()])
+                        else:
+                            start_pt = self.get_joint(start_joint)
+                        
+                        if end_joint == 'min_y':
+                            end_pt = np.array([self.vertices[:, 0].mean(), self.vertices[:, 1].min(), self.vertices[:, 2].mean()])
+                        else:
+                            end_pt = self.get_joint(end_joint)
+                        
+                        line_points = np.array([start_pt, end_pt])
+                        geodesic_path = pv.PolyData(line_points)
+                        geodesic_path.lines = np.array([2, 0, 1])
+                    
+                    # Visualize as a line/tube along inner leg
+                    if geodesic_path is not None and geodesic_path.n_points > 0:
+                        try:
+                            if geodesic_path.n_points > 2:
+                                # Geodesic path with multiple points: create a thin tube
+                                tube = geodesic_path.tube(radius=0.6, capping=False)
+                                if tube is not None and tube.n_points > 0:
+                                    self.plotter.add_mesh(tube, color=data['color'], name=f"line_{name}", 
+                                                        opacity=1.0, render=False, lighting=False)
+                                else:
+                                    # Fallback: draw line segments
+                                    for i in range(geodesic_path.n_points - 1):
+                                        line = pv.Line(geodesic_path.points[i], geodesic_path.points[i+1])
+                                        self.plotter.add_mesh(line, color=data['color'], line_width=5, 
+                                                            name=f"line_{name}_seg{i}", render=False, lighting=False)
+                            else:
+                                # Simple line
+                                if geodesic_path.n_points == 2:
+                                    line = pv.Line(geodesic_path.points[0], geodesic_path.points[1])
+                                    self.plotter.add_mesh(line, color=data['color'], line_width=6, 
+                                                        name=f"line_{name}", render=False, lighting=False)
+                        except Exception as e:
+                            print(f"Warning: Could not visualize inside leg path: {e}")
+                    
+                    # Add to panel
+                    code = name.split('(')[1].split(')')[0] if '(' in name else ''
+                    panel_lines.append(f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm")
                 else:
                     value = self.compute_length(start_joint, end_joint)
                     if start_joint == 'min_y':
@@ -1220,9 +1761,9 @@ class InteractiveBodyMeasurer:
                     line = pv.Line(start_pt, end_pt)
                     self.plotter.add_mesh(line, color=data['color'], line_width=4, 
                                         name=f"line_{name}", render=False, lighting=False)
-                
-                code = name.split('(')[1].split(')')[0] if '(' in name else ''
-                panel_lines.append(f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm")
+                    
+                    code = name.split('(')[1].split(')')[0] if '(' in name else ''
+                    panel_lines.append(f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm")
 
         # Visualize custom measurements
         for i, custom in enumerate(self.custom_measurements):
@@ -2064,6 +2605,264 @@ class InteractiveBodyMeasurer:
             self.shoulder_landmark_points = []
             self.shoulder_landmark_vertex_ids = []
 
+    def start_shoulder_crotch_picking(self):
+        """
+        Start picking 3 points for shoulder-crotch geodesic measurement (front torso length).
+        Pick points on the FRONT side: neck → chest/waist → hip.
+        """
+        # Disable any existing picking first
+        try:
+            self.plotter.disable_picking()
+            self.plotter.untrack_click_position(side='left')
+        except Exception:
+            pass
+        
+        # Clear previous shoulder-crotch picks visuals
+        for i in range(1, 4):
+            try:
+                self.plotter.remove_actor(f"shoulder_crotch_pt_{i}")
+            except (KeyError, ValueError):
+                pass
+        self.shoulder_crotch_landmark_points = []
+        self.shoulder_crotch_landmark_vertex_ids = []
+        self.shoulder_crotch_geodesic_path = None
+        self.shoulder_crotch_path_length = None
+        # Clear cache when starting manual picking (so default won't be used)
+        self._default_shoulder_crotch_width_cached = None
+        self._default_shoulder_crotch_path_cached = None
+        self._active_pick_mode = "shoulder_crotch"
+        self.picking_enabled = True
+        
+        # Use track_click_position with ray-trace intersection
+        def shoulder_crotch_click_callback(point):
+            if self._active_pick_mode != "shoulder_crotch":
+                return
+            self._handle_shoulder_crotch_pick_with_ray_trace(point)
+        
+        self.plotter.track_click_position(callback=shoulder_crotch_click_callback, side='left')
+        
+        self.plotter.add_text(
+            "Shoulder-Crotch mode: pick 3 points on FRONT side (neck → chest/waist → hip).",
+            position='upper_left',
+            font_size=13,
+            color='yellow',
+            name='status_msg',
+            font='courier',
+        )
+        self.plotter.render()
+    
+    def _handle_shoulder_crotch_pick_with_ray_trace(self, picked_pt):
+        """Handle shoulder-crotch pick by ray-tracing to find actual mesh intersection"""
+        if picked_pt is None:
+            return
+        
+        picked_pt = np.array(picked_pt)
+        
+        # Use PyVista's ray_trace to find the actual intersection point with the mesh
+        try:
+            # Get camera position
+            camera_pos = np.array(self.plotter.camera_position[0])
+            
+            # Calculate ray direction from camera to picked point
+            ray_dir = picked_pt - camera_pos
+            ray_dir_norm = np.linalg.norm(ray_dir)
+            if ray_dir_norm < 1e-6:
+                return
+            ray_dir = ray_dir / ray_dir_norm
+            
+            # Ray-trace from camera through picked point to find mesh intersection
+            ray_end = camera_pos + ray_dir * 1000.0
+            
+            # Find intersection with mesh
+            intersection, cell_ids = self.mesh.ray_trace(camera_pos, ray_end, first_point=True)
+            
+            if intersection is not None and len(intersection) > 0:
+                intersection_pt = intersection[0]
+                self._handle_shoulder_crotch_pick(intersection_pt)
+            else:
+                self._handle_shoulder_crotch_pick(picked_pt)
+        except Exception as e:
+            print(f"Warning: Ray-trace failed: {e}, using direct projection")
+            self._handle_shoulder_crotch_pick(picked_pt)
+    
+    def _handle_shoulder_crotch_pick(self, picked_input):
+        """Handle shoulder-crotch landmark pick - similar to shoulder pick"""
+        point_coords = None
+        
+        # 1. Convert input to valid [x,y,z] array
+        if isinstance(picked_input, (int, np.integer)):
+            point_coords = np.array(self.mesh.points[picked_input], dtype=float)
+        elif hasattr(picked_input, '__len__') and len(picked_input) == 3:
+            point_coords = np.array(picked_input, dtype=float)
+        else:
+            try:
+                pos = self.plotter.pick_mouse_position()
+                if pos is not None and len(pos) >= 3:
+                    idx = self.mesh.find_closest_point(pos[:3])
+                    point_coords = np.array(self.mesh.points[idx], dtype=float)
+                else:
+                    point_coords = np.array(picked_input, dtype=float)
+            except Exception:
+                point_coords = np.array(picked_input, dtype=float) if hasattr(picked_input, '__len__') else None
+        
+        if point_coords is None:
+            print(f"Warning: Could not extract valid coordinates from input: {picked_input}")
+            return
+        
+        # Ensure it's a 1D array of 3 elements
+        if point_coords.ndim > 1:
+            point_coords = point_coords.flatten()[:3]
+        if len(point_coords) != 3:
+            print(f"Warning: Invalid coordinate shape: {point_coords.shape}")
+            return
+        
+        # 2. Project to mesh surface
+        try:
+            closest_points, dists, vertex_indices = trimesh.proximity.closest_point(
+                self.trimesh_mesh, [point_coords]
+            )
+            point_coords = np.array(closest_points[0], dtype=float)
+            vertex_idx = int(vertex_indices[0])
+            dist_to_mesh = float(dists[0])
+            
+            if dist_to_mesh > 10.0:
+                print(f"Info: Point projected to mesh surface ({dist_to_mesh:.1f} cm away)")
+        except Exception as e:
+            print(f"Warning: Error projecting to mesh: {e}, using point as-is")
+            vertex_distances = np.linalg.norm(self.mesh.points - point_coords, axis=1)
+            vertex_idx = int(np.argmin(vertex_distances))
+            point_coords = np.array(self.mesh.points[vertex_idx], dtype=float)
+        
+        # 3. Append to list
+        if self.shoulder_crotch_landmark_points is None:
+            self.shoulder_crotch_landmark_points = []
+        if self.shoulder_crotch_landmark_vertex_ids is None:
+            self.shoulder_crotch_landmark_vertex_ids = []
+            
+        self.shoulder_crotch_landmark_points.append(point_coords.copy())
+        self.shoulder_crotch_landmark_vertex_ids.append(vertex_idx)
+        print(f"✓ Shoulder-Crotch Point {len(self.shoulder_crotch_landmark_points)} Added: {point_coords}")
+        
+        # 4. Visual Feedback
+        sphere = pv.Sphere(radius=2.5, center=point_coords)
+        point_num = len(self.shoulder_crotch_landmark_points)
+        if point_num == 1:
+            color = 'cyan'  # First point (neck)
+        elif point_num == 2:
+            color = 'yellow'  # Second point (chest/waist)
+        else:
+            color = 'magenta'  # Third point (hip)
+        self.plotter.add_mesh(sphere, color=color, name=f"shoulder_crotch_pt_{point_num}", render=False)
+        
+        remaining = 3 - len(self.shoulder_crotch_landmark_points)
+        if remaining > 0:
+            if point_num == 1:
+                next_point = "chest or waist (middle point on front)"
+            elif point_num == 2:
+                next_point = "hip (on front)"
+            else:
+                next_point = "unknown"
+            self.plotter.add_text(
+                f"Shoulder-Crotch: {point_num}/3 (pick {next_point})",
+                position='upper_left',
+                font_size=13,
+                color='yellow',
+                name='status_msg',
+                font='courier',
+            )
+            self.plotter.render()
+            return
+        
+        # 5. All 3 points picked - calculate the geodesic path
+        self._build_shoulder_crotch_geodesic_from_landmarks()
+        self._active_pick_mode = None
+        self.picking_enabled = False
+        try:
+            self.plotter.untrack_click_position(side='left')
+        except Exception:
+            pass
+        self.plotter.add_text(
+            "✓ Shoulder-Crotch path set. Measurement follows front surface from neck to hip.",
+            position='upper_left',
+            font_size=13,
+            color='lightgreen',
+            name='status_msg',
+            font='courier',
+        )
+        self.update_measurement_visuals()
+    
+    def _build_shoulder_crotch_geodesic_from_landmarks(self):
+        """Calculate shoulder-crotch geodesic path from 3 manually picked points"""
+        try:
+            if len(self.shoulder_crotch_landmark_points) < 3:
+                print(f"Error: Need 3 points, got {len(self.shoulder_crotch_landmark_points)}")
+                return
+            
+            p0 = np.array(self.shoulder_crotch_landmark_points[0], dtype=float)  # Neck
+            p1 = np.array(self.shoulder_crotch_landmark_points[1], dtype=float)  # Chest/Waist
+            p2 = np.array(self.shoulder_crotch_landmark_points[2], dtype=float)  # Hip
+            
+            print(f"Debug: Shoulder-Crotch points - Neck: {p0}, Chest/Waist: {p1}, Hip: {p2}")
+            
+            # Find mesh indices
+            idx0 = self.mesh.find_closest_point(p0)
+            idx1 = self.mesh.find_closest_point(p1)
+            idx2 = self.mesh.find_closest_point(p2)
+            
+            # Calculate geodesic paths: neck → chest/waist → hip
+            path_01 = self.mesh.geodesic(idx0, idx1)
+            path_12 = self.mesh.geodesic(idx1, idx2)
+            
+            if path_01 is None or path_12 is None:
+                print("Warning: Geodesic calculation failed, using straight line")
+                combined_points = np.array([p0, p1, p2])
+                total_length = np.linalg.norm(p1 - p0) + np.linalg.norm(p2 - p1)
+            else:
+                # Combine paths
+                points_01 = path_01.points.copy()
+                points_12 = path_12.points.copy()
+                
+                # Snap endpoints to exact picked points
+                if len(points_01) > 0:
+                    points_01[0] = p0
+                    points_01[-1] = p1
+                if len(points_12) > 0:
+                    points_12[0] = p1
+                    points_12[-1] = p2
+                
+                # Combine, removing duplicate at junction
+                if len(points_12) > 1:
+                    combined_points = np.vstack([points_01, points_12[1:]])
+                else:
+                    combined_points = np.vstack([points_01, points_12])
+                
+                # Ensure exact start and end
+                combined_points[0] = p0
+                combined_points[-1] = p2
+                
+                # Calculate length
+                total_length = 0.0
+                for i in range(len(combined_points) - 1):
+                    total_length += np.linalg.norm(combined_points[i+1] - combined_points[i])
+            
+            print(f"SHOULDER-CROTCH: {total_length:.2f} cm")
+            
+            # Store path and length
+            full_path = pv.PolyData(combined_points)
+            n_points = len(combined_points)
+            lines_array = np.empty(n_points + 1, dtype=np.int32)
+            lines_array[0] = n_points
+            lines_array[1:] = np.arange(n_points, dtype=np.int32)
+            full_path.lines = lines_array
+            
+            self.shoulder_crotch_geodesic_path = full_path
+            self.shoulder_crotch_path_length = total_length
+            
+        except Exception as e:
+            print(f"Error building shoulder-crotch geodesic: {e}")
+            import traceback
+            traceback.print_exc()
+
     def setup_ui(self):
         # Set background
         self.plotter.background_color = 'black'
@@ -2144,6 +2943,7 @@ class InteractiveBodyMeasurer:
             "[Z] Undo Last Point\n"
             "[B] Set Neck (B) via Geodesic\n"
             "[O] Set Shoulder Width (O) via Geodesic (pick 7 points)\n"
+            "[S] Set Shoulder-Crotch (C) via Geodesic (pick 3 points on front)\n"
             "[R] Reset View\n\n"
             "SLIDERS:\n"
             "Adjust measurement height offset (cm)\n\n"
@@ -2165,6 +2965,8 @@ class InteractiveBodyMeasurer:
         self.plotter.add_key_event('B', self.start_neck_landmark_picking)
         self.plotter.add_key_event('o', self.start_shoulder_width_picking)
         self.plotter.add_key_event('O', self.start_shoulder_width_picking)
+        self.plotter.add_key_event('s', self.start_shoulder_crotch_picking)
+        self.plotter.add_key_event('S', self.start_shoulder_crotch_picking)
         self.plotter.add_key_event('r', lambda: self.plotter.reset_camera())
         self.plotter.add_key_event('R', lambda: self.plotter.reset_camera())
 
