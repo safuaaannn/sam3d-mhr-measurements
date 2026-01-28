@@ -22,9 +22,10 @@ from scipy.interpolate import interp1d
 from mhr.mhr import MHR
 
 class InteractiveBodyMeasurer:
-    def __init__(self, pkl_path, target_height_cm=173.0):
+    def __init__(self, pkl_path, target_height_cm=173.0, auto_export=False):
         self.pkl_path = pkl_path
         self.target_height_cm = target_height_cm
+        self.auto_export = auto_export
         
         # 1. Load Data
         with open(self.pkl_path, 'rb') as f:
@@ -78,11 +79,15 @@ class InteractiveBodyMeasurer:
             # Neck (B): Use neck-to-head vector for proper circular slice at mid-neck (light blue position)
             'Neck (B)':    {'joint': 'c_neck',   'normal': [0, 1, 0], 'neck_aligned': True, 'neck_height_ratio': 0.45, 'offset': 0.0, 'color': 'cyan', 'exclude_arms': False, 'type': 'circumference'},
             # Torso circumferences - use consistent torso vector (pelvis to neck) for perpendicular normal
-            'Chest (D)':   {'joint': 'c_spine2', 'normal': [0, 1, 0], 'torso_aligned': True, 'offset': 0.0, 'color': 'yellow', 'exclude_arms': True, 'type': 'circumference'},
-            'Waist (E)':   {'joint': 'c_spine0', 'normal': [0, 1, 0], 'torso_aligned': True, 'offset': 0.0, 'color': 'green', 'exclude_arms': True, 'type': 'circumference'},
+            # Chest (D): Offset +11.4 cm to position at fullest part of bust/chest (nipple line)
+            'Chest (D)':   {'joint': 'c_spine2', 'normal': [0, 1, 0], 'torso_aligned': True, 'offset': 11.4, 'color': 'yellow', 'exclude_arms': True, 'type': 'circumference'},
+            # Waist (E): Offset +15.5 cm to position at natural waist (narrowest part of torso)
+            'Waist (E)':   {'joint': 'c_spine0', 'normal': [0, 1, 0], 'torso_aligned': True, 'offset': 15.5, 'color': 'green', 'exclude_arms': True, 'type': 'circumference'},
             'Hip (F)':     {'joint': 'root',     'normal': [0, 1, 0], 'torso_aligned': True, 'offset': 0.0, 'color': 'cyan', 'exclude_arms': True, 'type': 'circumference'},
-            'Thigh (L)':   {'joint': 'l_upleg',  'normal': [0, 1, 0], 'offset': -15.0, 'color': 'blue', 'exclude_arms': False, 'type': 'circumference', 'midpoint': ['l_upleg', 'l_lowleg']},
-            'Calf (M)':    {'joint': 'l_lowleg', 'normal': [0, 1, 0], 'offset': -15.0, 'color': 'purple', 'exclude_arms': False, 'type': 'circumference', 'midpoint': ['l_lowleg', 'l_foot']},
+            # Thigh (L): Offset +6.99 cm from midpoint (upper thigh position)
+            'Thigh (L)':   {'joint': 'l_upleg',  'normal': [0, 1, 0], 'offset': 6.99, 'color': 'blue', 'exclude_arms': False, 'type': 'circumference', 'midpoint': ['l_upleg', 'l_lowleg']},
+            # Calf (M): Offset +11.0 cm from midpoint (maximum calf circumference)
+            'Calf (M)':    {'joint': 'l_lowleg', 'normal': [0, 1, 0], 'offset': 11.0, 'color': 'purple', 'exclude_arms': False, 'type': 'circumference', 'midpoint': ['l_lowleg', 'l_foot']},
             'Ankle (N)':   {'joint': 'l_foot',   'normal': [0, 1, 0], 'offset': 2.0, 'color': 'magenta', 'exclude_arms': False, 'type': 'circumference'},
             # Arm circumferences - use bone direction for proper circular slices
             'Wrist (G)':   {'joint': 'r_wrist',  'normal': [1, 0, 0], 'normal_from': ['r_lowarm', 'r_wrist'], 'offset': 0.0, 'color': 'brown', 'exclude_arms': False, 'type': 'circumference'},
@@ -140,6 +145,10 @@ class InteractiveBodyMeasurer:
         # Cache for default shoulder-crotch calculation
         self._default_shoulder_crotch_width_cached = None
         self._default_shoulder_crotch_path_cached = None
+        
+        # Cache for inside leg calculation (to avoid repeated recalculations)
+        self._inside_leg_path_length_cached = None
+        self._inside_leg_path_cached = None
         
         self.plotter = pv.Plotter(title="Sam3D Interactive Measurements")
         
@@ -660,6 +669,10 @@ class InteractiveBodyMeasurer:
         Compute Inside Leg (Inseam) measurement using geodesic path along the inner leg surface.
         Path: Saddle point (crotch) → Inner ankle (medial malleolus)
         """
+        # Check cache first
+        if self._inside_leg_path_length_cached is not None and self._inside_leg_path_cached is not None:
+            return self._inside_leg_path_length_cached, self._inside_leg_path_cached
+        
         try:
             # 1. Find start point: Saddle point (crotch) - lowest point between legs
             root_pt = np.array(self.get_joint('root'), dtype=float)  # Pelvis center
@@ -801,6 +814,9 @@ class InteractiveBodyMeasurer:
                         path_length += np.linalg.norm(combined_points[i+1] - combined_points[i])
                     
                     print(f"Debug: Inside Leg geodesic calculated: {path_length:.2f} cm")
+                    # Cache the result
+                    self._inside_leg_path_length_cached = path_length
+                    self._inside_leg_path_cached = full_path
                     return path_length, full_path
                 else:
                     # Geodesic failed, use straight line
@@ -1318,6 +1334,10 @@ class InteractiveBodyMeasurer:
 
         # Build a single stable measurement panel (upper-left)
         panel_lines = []
+        
+        # Store computed measurements for CSV export
+        self.computed_measurements = {}
+        
         panel_lines.append("HEAD & TORSO")
         
         torso_measurements = ['Head (A)', 'Neck (B)', 'Chest (D)', 'Waist (E)', 'Hip (F)']
@@ -1405,6 +1425,10 @@ class InteractiveBodyMeasurer:
                 code = name.split('(')[1].split(')')[0] if '(' in name else ''
                 label = f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm"
                 panel_lines.append(label)
+                
+                # Store for CSV export
+                if code:
+                    self.computed_measurements[code] = value
         
         # Length measurements
         if 'Shoulder-Crotch (C)' in self.length_measurements:
@@ -1451,6 +1475,8 @@ class InteractiveBodyMeasurer:
             code = name.split('(')[1].split(')')[0] if '(' in name else ''
             label = f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm"
             panel_lines.append(label)
+            if code:
+                self.computed_measurements[code] = value
         
         if 'Shoulder Width (O)' in self.length_measurements:
             name = 'Shoulder Width (O)'
@@ -1574,6 +1600,8 @@ class InteractiveBodyMeasurer:
             code = name.split('(')[1].split(')')[0] if '(' in name else ''
             label = f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm"
             panel_lines.append(label)
+            if code:
+                self.computed_measurements[code] = value
 
         panel_lines.append("")
         panel_lines.append("ARMS")
@@ -1624,6 +1652,10 @@ class InteractiveBodyMeasurer:
                 code = name.split('(')[1].split(')')[0] if '(' in name else ''
                 label = f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm"
                 panel_lines.append(label)
+                
+                # Store for CSV export
+                if code:
+                    self.computed_measurements[code] = value
         
         # Arm Length
         if 'Arm Length (J)' in self.length_measurements:
@@ -1640,6 +1672,7 @@ class InteractiveBodyMeasurer:
                     self.plotter.add_mesh(line, color=data['color'], line_width=4, 
                                         name=f"line_Arm Length (J)_seg{i}", render=False, lighting=False)
                 panel_lines.append(f"J  Arm Length     {total_length:>6.1f} cm")
+                self.computed_measurements['J'] = total_length
 
         panel_lines.append("")
         panel_lines.append("LEGS")
@@ -1673,6 +1706,8 @@ class InteractiveBodyMeasurer:
                 
                 code = name.split('(')[1].split(')')[0] if '(' in name else ''
                 panel_lines.append(f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm")
+                if code:
+                    self.computed_measurements[code] = value
 
         # Always show a neck-zone hint overlay (to match the reference "tilted" measurement area)
         # If a geodesic is already set, the user still benefits from the zone highlight.
@@ -1746,6 +1781,8 @@ class InteractiveBodyMeasurer:
                     # Add to panel
                     code = name.split('(')[1].split(')')[0] if '(' in name else ''
                     panel_lines.append(f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm")
+                    if code:
+                        self.computed_measurements[code] = value
                 else:
                     value = self.compute_length(start_joint, end_joint)
                     if start_joint == 'min_y':
@@ -1764,6 +1801,12 @@ class InteractiveBodyMeasurer:
                     
                     code = name.split('(')[1].split(')')[0] if '(' in name else ''
                     panel_lines.append(f"{code}  {name.split('(')[0].strip():<12} {value:>6.1f} cm")
+                    if code:
+                        self.computed_measurements[code] = value
+
+        # Store height
+        self.computed_measurements['P'] = self.target_height_cm
+
 
         # Visualize custom measurements
         for i, custom in enumerate(self.custom_measurements):
@@ -1966,6 +2009,72 @@ class InteractiveBodyMeasurer:
                             position='upper_left', font_size=13, color='lightgreen', 
                             name='status_msg', font='courier')
         self.update_measurement_visuals()
+
+    def export_measurements_to_csv(self):
+        """Export current measurements to CSV file"""
+        import csv
+        from datetime import datetime
+        from pathlib import Path
+        
+        try:
+            # Prepare output path
+            output_dir = Path("output")
+            output_dir.mkdir(exist_ok=True)
+            csv_path = output_dir / "interactive_measurements.csv"
+            
+            # Measurement labels
+            labels = {
+                'A': 'Head Circumference',
+                'B': 'Neck Circumference',
+                'C': 'Shoulder to Crotch Height',
+                'D': 'Chest Circumference',
+                'E': 'Waist Circumference',
+                'F': 'Hip Circumference',
+                'G': 'Wrist Right Circumference',
+                'H': 'Bicep Right Circumference',
+                'I': 'Forearm Right Circumference',
+                'J': 'Arm Right Length',
+                'K': 'Inside Leg Height',
+                'L': 'Thigh Left Circumference',
+                'M': 'Calf Left Circumference',
+                'N': 'Ankle Left Circumference',
+                'O': 'Shoulder Breadth',
+                'P': 'Height',
+            }
+            
+            # Use pre-computed measurements from display
+            if not hasattr(self, 'computed_measurements') or not self.computed_measurements:
+                raise ValueError("No measurements computed yet. Please wait for measurements to load.")
+            
+            # Write CSV
+            with open(csv_path, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                
+                # Header
+                writer.writerow(['Body Measurements Report (Interactive Tool)'])
+                writer.writerow(['Generated:', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+                writer.writerow(['Target Height:', f'{self.target_height_cm} cm'])
+                writer.writerow([])
+                
+                # Data
+                writer.writerow(['Code', 'Measurement', 'Value (cm)'])
+                for key in sorted(labels.keys()):
+                    label = labels[key]
+                    value = self.computed_measurements.get(key, 0.0)
+                    writer.writerow([key, label, f'{value:.2f}'])
+            
+            # Show success message
+            self.plotter.add_text(f"✓ Measurements exported to: {csv_path}", 
+                                position='upper_left', font_size=13, color='lightgreen', 
+                                name='status_msg', font='courier')
+            print(f"\n📄 Measurements exported to: {csv_path}\n")
+            
+        except Exception as e:
+            error_msg = f"✗ Export failed: {str(e)}"
+            self.plotter.add_text(error_msg, position='upper_left', font_size=13, 
+                                color='red', name='status_msg', font='courier')
+            print(f"\n❌ {error_msg}\n")
+
 
     def start_neck_landmark_picking(self):
         """
@@ -2944,6 +3053,7 @@ class InteractiveBodyMeasurer:
             "[B] Set Neck (B) via Geodesic\n"
             "[O] Set Shoulder Width (O) via Geodesic (pick 7 points)\n"
             "[S] Set Shoulder-Crotch (C) via Geodesic (pick 3 points on front)\n"
+            "[E] Export Measurements to CSV\n"
             "[R] Reset View\n\n"
             "SLIDERS:\n"
             "Adjust measurement height offset (cm)\n\n"
@@ -2967,6 +3077,8 @@ class InteractiveBodyMeasurer:
         self.plotter.add_key_event('O', self.start_shoulder_width_picking)
         self.plotter.add_key_event('s', self.start_shoulder_crotch_picking)
         self.plotter.add_key_event('S', self.start_shoulder_crotch_picking)
+        self.plotter.add_key_event('e', self.export_measurements_to_csv)
+        self.plotter.add_key_event('E', self.export_measurements_to_csv)
         self.plotter.add_key_event('r', lambda: self.plotter.reset_camera())
         self.plotter.add_key_event('R', lambda: self.plotter.reset_camera())
 
@@ -2977,6 +3089,14 @@ class InteractiveBodyMeasurer:
             import traceback
             traceback.print_exc()
         
+        # Auto-export if requested (before viewer starts)
+        if self.auto_export:
+            print("\n🔄 Auto-exporting measurements to CSV...")
+            try:
+                self.export_measurements_to_csv()
+            except Exception as e:
+                print(f"Warning: Auto-export failed: {e}")
+        
         # Show plotter and keep it open
         self.plotter.show(interactive=True, auto_close=False)
 
@@ -2984,12 +3104,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive 3D Body Measurement Tool")
     parser.add_argument("--pkl", type=str, required=True, help="Path to Sam3D output pickle file")
     parser.add_argument("--height", type=float, default=173.0, help="Target height in cm")
+    parser.add_argument("--auto-export", action="store_true", 
+                       help="Automatically export CSV after loading (no manual 'E' press needed)")
     
     args = parser.parse_args()
     
     try:
         print("Initializing Interactive Body Measurer...")
-        app = InteractiveBodyMeasurer(args.pkl, args.height)
+        app = InteractiveBodyMeasurer(args.pkl, args.height, auto_export=args.auto_export)
         print("Application started successfully!")
     except Exception as e:
         print(f"ERROR: Failed to start application: {e}")
